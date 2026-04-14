@@ -773,6 +773,7 @@ class ArmWrenchPredictor:
             device=device,
         )
 
+        wp.synchronize_device(device)
         return self.joint_tau  # [0:6] = root free-joint = drone wrench
 
     # ---------------------------------------------------------------------- #
@@ -927,5 +928,12 @@ class ArmWrenchPredictor:
             device=device,
         )
 
-        # Return as (num_envs, total_qd) torch tensor — zero-copy view.
-        return wp.to_torch(self._jtau_b).view(E, topo.total_qd)
+        # Synchronize the Warp CUDA stream before handing data to PhysX/PyTorch.
+        # Without this, PhysX (which runs on a different CUDA stream) may read
+        # the output buffer before the RNEA kernels have finished writing it,
+        # causing illegal memory access errors.
+        wp.synchronize_device(device)
+
+        # Clone into a contiguous PyTorch tensor that is fully independent of
+        # Warp's memory pool — safe to pass directly to add_forces_and_torques.
+        return wp.to_torch(self._jtau_b).view(E, topo.total_qd).clone()
