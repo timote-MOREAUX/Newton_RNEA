@@ -778,6 +778,16 @@ class ArmWrenchPredictor:
         )
 
         wp.synchronize_device(device)
+
+        # Shift wrench from world origin to drone root body position.
+        # RNEA expresses all spatial forces about the world origin; the root
+        # FREE joint tau[3:6] is therefore the moment about the world origin.
+        # Subtract r_drone × force to get the moment about the drone body.
+        if not topo.is_fixed_base:
+            tau_t = wp.to_torch(self.joint_tau)
+            r = self._q_work[0:3]                            # drone pos in world
+            tau_t[3:6].sub_(torch.linalg.cross(r, tau_t[0:3].clone()))
+
         return self.joint_tau  # [0:6] = root free-joint = drone wrench
 
     # ---------------------------------------------------------------------- #
@@ -940,4 +950,11 @@ class ArmWrenchPredictor:
 
         # Clone into a contiguous PyTorch tensor that is fully independent of
         # Warp's memory pool — safe to pass directly to add_forces_and_torques.
-        return wp.to_torch(self._jtau_b).view(E, topo.total_qd).clone()
+        result = wp.to_torch(self._jtau_b).view(E, topo.total_qd).clone()
+
+        # Shift wrench from world origin to drone root body position (all envs).
+        if not topo.is_fixed_base:
+            r_all = self._q_work_b2d[:, 0:3]                # (E, 3) drone positions
+            result[:, 3:6].sub_(torch.linalg.cross(r_all, result[:, 0:3]))
+
+        return result
