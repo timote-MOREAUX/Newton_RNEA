@@ -861,3 +861,38 @@ def compute_com_transforms(
     tid = wp.tid()
     com = body_com[tid]
     body_X_com[tid] = wp.transform(com, wp.quat_identity())
+
+
+@wp.kernel
+def shift_root_wrench_to_body(
+    joint_q:   wp.array(dtype=wp.float32),   # full q array; [0:3] = drone position (x,y,z)
+    joint_tau: wp.array(dtype=wp.float32),   # full tau array; [3:6] corrected in-place
+):
+    """Single-env: subtract r × f from the root-joint moment (dim=1)."""
+    px = joint_q[0];  py = joint_q[1];  pz = joint_q[2]
+    fx = joint_tau[0]; fy = joint_tau[1]; fz = joint_tau[2]
+    joint_tau[3] = joint_tau[3] - (py * fz - pz * fy)
+    joint_tau[4] = joint_tau[4] - (pz * fx - px * fz)
+    joint_tau[5] = joint_tau[5] - (px * fy - py * fx)
+
+
+@wp.kernel
+def shift_root_wrenches_to_body(
+    joint_q_b:   wp.array(dtype=wp.float32),  # (E * total_q,) flat
+    joint_tau_b: wp.array(dtype=wp.float32),  # (E * total_qd,) flat; [3:6] per env corrected
+    total_q:  int,
+    total_qd: int,
+):
+    """Batched: one thread per environment."""
+    e      = wp.tid()
+    q_off  = e * total_q
+    qd_off = e * total_qd
+    px = joint_q_b[q_off + 0]
+    py = joint_q_b[q_off + 1]
+    pz = joint_q_b[q_off + 2]
+    fx = joint_tau_b[qd_off + 0]
+    fy = joint_tau_b[qd_off + 1]
+    fz = joint_tau_b[qd_off + 2]
+    joint_tau_b[qd_off + 3] = joint_tau_b[qd_off + 3] - (py * fz - pz * fy)
+    joint_tau_b[qd_off + 4] = joint_tau_b[qd_off + 4] - (pz * fx - px * fz)
+    joint_tau_b[qd_off + 5] = joint_tau_b[qd_off + 5] - (px * fy - py * fx)

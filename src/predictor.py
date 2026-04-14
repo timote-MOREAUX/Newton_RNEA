@@ -18,6 +18,8 @@ from .kernels import (
     eval_rigid_tau,
     compute_spatial_inertia,
     compute_com_transforms,
+    shift_root_wrench_to_body,
+    shift_root_wrenches_to_body,
 )
 
 
@@ -777,17 +779,20 @@ class ArmWrenchPredictor:
             device=device,
         )
 
-        wp.synchronize_device(device)
-
         # Shift wrench from world origin to drone root body position.
         # RNEA expresses all spatial forces about the world origin; the root
-        # FREE joint tau[3:6] is therefore the moment about the world origin.
+        # FREE joint tau[3:6] is the moment about the world origin.
         # Subtract r_drone × force to get the moment about the drone body.
+        # Runs in Warp's stream — no PyTorch cross-stream hazard.
         if not topo.is_fixed_base:
-            tau_t = wp.to_torch(self.joint_tau)
-            r = self._q_work[0:3]                            # drone pos in world
-            tau_t[3:6].sub_(torch.linalg.cross(r, tau_t[0:3].clone()))
+            wp.launch(
+                shift_root_wrench_to_body,
+                dim=1,
+                inputs=[self._joint_q_wp, self.joint_tau],
+                device=device,
+            )
 
+        wp.synchronize_device(device)
         return self.joint_tau  # [0:6] = root free-joint = drone wrench
 
     # ---------------------------------------------------------------------- #
@@ -948,13 +953,18 @@ class ArmWrenchPredictor:
         # causing illegal memory access errors.
         wp.synchronize_device(device)
 
+        # Shift wrench from world origin to drone root body position (all envs).
+        # Runs in Warp's stream before synchronize — no cross-stream hazard.
+        if not topo.is_fixed_base:
+            wp.launch(
+                shift_root_wrenches_to_body,
+                dim=E,
+                inputs=[self._jq_b_wp, self._jtau_b, topo.total_q, topo.total_qd],
+                device=device,
+            )
+
+        wp.synchronize_device(device)
+
         # Clone into a contiguous PyTorch tensor that is fully independent of
         # Warp's memory pool — safe to pass directly to add_forces_and_torques.
-        result = wp.to_torch(self._jtau_b).view(E, topo.total_qd).clone()
-
-        # Shift wrench from world origin to drone root body position (all envs).
-        if not topo.is_fixed_base:
-            r_all = self._q_work_b2d[:, 0:3]                # (E, 3) drone positions
-            result[:, 3:6].sub_(torch.linalg.cross(r_all, result[:, 0:3]))
-
-        return result
+        return wp.to_torch(self._jtau_b).view(E, topo.total_qd).clone()
