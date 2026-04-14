@@ -445,15 +445,17 @@ class ArmWrenchPredictor:
         # ------------------------------------------------------------------ #
         # Working buffers (reused every kernel call).                         #
         # ------------------------------------------------------------------ #
-        self.joint_S_s  = wp.empty((topo.total_qd,), dtype=wp.spatial_vector, device=device)
-        self.body_I_s   = wp.empty((num_bodies,),    dtype=wp.spatial_matrix, device=device)
-        self.body_v_s   = wp.empty((num_bodies,),    dtype=wp.spatial_vector, device=device)
-        self.body_f_s   = wp.zeros((num_bodies,),    dtype=wp.spatial_vector, device=device)
-        self.body_a_s   = wp.empty((num_bodies,),    dtype=wp.spatial_vector, device=device)
-        self.body_ft_s  = wp.zeros((num_bodies,),    dtype=wp.spatial_vector, device=device)
-        self.body_q_com = wp.empty((num_bodies,),    dtype=wp.transform,      device=device)
-        self.body_q     = wp.empty((num_bodies,),    dtype=wp.transform,      device=device)
-        self.joint_tau  = wp.empty((topo.total_qd,), dtype=wp.float32,        device=device)
+        self.joint_S_s      = wp.empty((topo.total_qd,), dtype=wp.spatial_vector, device=device)
+        self.body_I_s       = wp.empty((num_bodies,),    dtype=wp.spatial_matrix, device=device)
+        self.body_v_s       = wp.empty((num_bodies,),    dtype=wp.spatial_vector, device=device)
+        self.body_f_s       = wp.zeros((num_bodies,),    dtype=wp.spatial_vector, device=device)
+        self.body_a_s       = wp.empty((num_bodies,),    dtype=wp.spatial_vector, device=device)
+        self.body_ft_s      = wp.zeros((num_bodies,),    dtype=wp.spatial_vector, device=device)
+        self.body_q_com     = wp.empty((num_bodies,),    dtype=wp.transform,      device=device)
+        self.body_q         = wp.empty((num_bodies,),    dtype=wp.transform,      device=device)
+        self.joint_tau      = wp.empty((topo.total_qd,), dtype=wp.float32,        device=device)
+        # eval_rigid_tau reads body_f_ext unconditionally — must not be None.
+        self.body_f_ext_zero = wp.zeros((num_bodies,),   dtype=wp.spatial_vector, device=device)
 
         # Single-element zero-gravity array.  Must be wp.vec3 dtype because
         # the kernel does `gravity[world_idx]` → wp.vec3.
@@ -594,9 +596,11 @@ class ArmWrenchPredictor:
         self._bqcom_b = wp.empty((E * NB,),       dtype=wp.transform,      device=device)
         self._jtau_b  = wp.empty((E * total_qd,), dtype=wp.float32,        device=device)
 
-        self._jf_zero_b      = wp.zeros((E * total_qd,), dtype=wp.float32, device=device)
-        self._jtgt_zero_b    = wp.zeros((E * total_qd,), dtype=wp.float32, device=device)
-        self._jke_zero_b     = wp.zeros((E * total_qd,), dtype=wp.float32, device=device)
+        self._jf_zero_b      = wp.zeros((E * total_qd,), dtype=wp.float32,        device=device)
+        self._jtgt_zero_b    = wp.zeros((E * total_qd,), dtype=wp.float32,        device=device)
+        self._jke_zero_b     = wp.zeros((E * total_qd,), dtype=wp.float32,        device=device)
+        # eval_rigid_tau reads body_f_ext unconditionally — must not be None.
+        self._bfext_zero_b   = wp.zeros((E * NB,),       dtype=wp.spatial_vector, device=device)
 
     # ---------------------------------------------------------------------- #
 
@@ -764,7 +768,7 @@ class ArmWrenchPredictor:
                 self._joint_limit_kd,
                 self.joint_S_s,
                 self.body_f_s,
-                None,
+                self.body_f_ext_zero,
             ],
             outputs=[
                 self.body_ft_s,
@@ -919,7 +923,7 @@ class ArmWrenchPredictor:
                 self._jlim_kd_b,
                 self._jS_b,
                 self._bf_b,
-                None,
+                self._bfext_zero_b,
             ],
             outputs=[
                 self._bft_b,
