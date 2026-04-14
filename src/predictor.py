@@ -520,7 +520,7 @@ class ArmWrenchPredictor:
         # joint_dof_dim: (NJ, 2) — same for every env
         jdof_np = topo.joint_dof_dim.numpy()                      # (NJ, 2)
         self._jdof_b = wp.array(np.tile(jdof_np, (E, 1)).reshape(-1, 2),
-                                dtype=wp.int32, device=device)
+                                dtype=wp.int32, ndim=2, device=device)
 
         # joint_q_start / joint_qd_start: offset by e*total_q / e*total_qd
         jqs_np  = topo.joint_q_start.numpy()                      # (NJ,)
