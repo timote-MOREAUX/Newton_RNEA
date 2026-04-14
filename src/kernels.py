@@ -283,9 +283,16 @@ def transform_twist(t: wp.transform, x: wp.spatial_vector) -> wp.spatial_vector:
         wp.spatial_vector: Transformed twist in Newton layout
         ``(linear, angular)``.
     """
-    x_wp = wp.spatial_vector(wp.spatial_bottom(x), wp.spatial_top(x))
-    y_wp = wp.transform_twist(t, x_wp)
-    return wp.spatial_vector(wp.spatial_bottom(y_wp), wp.spatial_top(y_wp))
+    # Reorder Newton layout (linear, angular) → Warp layout (angular, linear).
+    omega = wp.spatial_bottom(x)
+    v     = wp.spatial_top(x)
+    # Apply rigid transform: only the rotation acts on both components;
+    # the translation introduces a coupling term on the linear part.
+    p         = wp.transform_get_translation(t)
+    omega_new = wp.transform_vector(t, omega)
+    v_new     = wp.transform_vector(t, v) + wp.cross(p, omega_new)
+    # Reorder back to Newton layout (linear, angular).
+    return wp.spatial_vector(v_new, omega_new)
 
 # compute motion subspace and velocity for a joint
 @wp.func
