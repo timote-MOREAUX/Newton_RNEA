@@ -393,10 +393,10 @@ class ArmWrenchPredictor:
         bids = topo.body_ids  # IsaacLab indices of the arm bodies
 
         mass_wp = wp.from_torch(
-            data.default_mass[0, bids].contiguous(), dtype=wp.float32
+            data.default_mass[0, bids].to(device).contiguous(), dtype=wp.float32
         )
         inertia_wp = wp.from_torch(
-            data.default_inertia[0, bids].reshape(num_bodies, 3, 3).contiguous(),
+            data.default_inertia[0, bids].reshape(num_bodies, 3, 3).to(device).contiguous(),
             dtype=wp.mat33,
         )
         self.body_I_m = wp.empty((num_bodies,), dtype=wp.spatial_matrix, device=device)
@@ -409,7 +409,7 @@ class ArmWrenchPredictor:
         )
 
         com_pos_wp = wp.from_torch(
-            data.body_com_pose_b[0, bids, :3].contiguous(), dtype=wp.vec3
+            data.body_com_pose_b[0, bids, :3].to(device).contiguous(), dtype=wp.vec3
         )
         self.body_X_com = wp.empty((num_bodies,), dtype=wp.transform, device=device)
         wp.launch(
