@@ -484,6 +484,140 @@ class ArmWrenchPredictor:
         self.joint_ke_zero     = wp.zeros((topo.total_qd,), dtype=wp.float32, device=device)
 
         self._root_dofs = root_dofs
+        self._num_envs  = env.num_envs
+
+        # Pre-build tiled topology + working buffers for all-env batch launch.
+        self._setup_batched()
+
+    # ---------------------------------------------------------------------- #
+
+    def _setup_batched(self) -> None:
+        """
+        Tile the single-env topology arrays into batched equivalents so that
+        ``compute_all_wrenches`` can run one kernel launch across all
+        environments instead of looping.
+
+        Naming convention:
+          *_b  — batched Warp arrays (size = num_envs × single-env size)
+        """
+        topo       = self._topo
+        device     = self._device
+        E          = self._num_envs
+        NJ         = topo.num_joints
+        NB         = len(topo.body_ids)
+        total_q    = topo.total_q
+        total_qd   = topo.total_qd
+
+        # ---- tile scalar-per-joint arrays --------------------------------- #
+        # joint_type: same for every env
+        jtype_np = topo.joint_type.numpy()                         # (NJ,)
+        self._jtype_b = wp.array(np.tile(jtype_np, E),
+                                 dtype=wp.int32, device=device)
+
+        # joint_parent / joint_child: body indices must be offset by e*NB.
+        # Parent == -1 means "world" (floating root); keep -1 intact.
+        jp_np = topo.joint_parent.numpy()                          # (NJ,)
+        jc_np = topo.joint_child.numpy()                           # (NJ,)
+        jp_blocks = [np.where(jp_np < 0, jp_np, jp_np + e * NB) for e in range(E)]
+        jc_blocks = [jc_np + e * NB                               for e in range(E)]
+        self._jparent_b = wp.array(np.concatenate(jp_blocks),
+                                   dtype=wp.int32, device=device)
+        self._jchild_b  = wp.array(np.concatenate(jc_blocks),
+                                   dtype=wp.int32, device=device)
+
+        # joint_X_p / joint_X_c: frame transforms are env-independent
+        jXp_np = topo.joint_X_p.numpy()                           # (NJ, 7)
+        jXc_np = topo.joint_X_c.numpy()                           # (NJ, 7)
+        self._jXp_b = wp.array(np.tile(jXp_np, (E, 1)).reshape(-1, 7),
+                                dtype=wp.transform, device=device)
+        self._jXc_b = wp.array(np.tile(jXc_np, (E, 1)).reshape(-1, 7),
+                                dtype=wp.transform, device=device)
+
+        # joint_axis: (total_qd, 3) — DoF-indexed, tile with qd offset bookkeeping
+        jaxis_np = topo.joint_axis.numpy()                         # (total_qd, 3)
+        self._jaxis_b = wp.array(np.tile(jaxis_np, (E, 1)).reshape(-1, 3),
+                                 dtype=wp.vec3, device=device)
+
+        # joint_dof_dim: (NJ, 2) — same for every env
+        jdof_np = topo.joint_dof_dim.numpy()                      # (NJ, 2)
+        self._jdof_b = wp.array(np.tile(jdof_np, (E, 1)).reshape(-1, 2),
+                                dtype=wp.int32, device=device)
+
+        # joint_q_start / joint_qd_start: offset by e*total_q / e*total_qd
+        jqs_np  = topo.joint_q_start.numpy()                      # (NJ,)
+        jqds_np = topo.joint_qd_start.numpy()                     # (NJ,)
+        jqs_blocks  = [jqs_np  + e * total_q  for e in range(E)]
+        jqds_blocks = [jqds_np + e * total_qd for e in range(E)]
+        self._jqs_b  = wp.array(np.concatenate(jqs_blocks),
+                                dtype=wp.int32, device=device)
+        self._jqds_b = wp.array(np.concatenate(jqds_blocks),
+                                dtype=wp.int32, device=device)
+
+        # articulation_start: [0, NJ, 2*NJ, ..., E*NJ]
+        self._art_start_b = wp.array(
+            np.arange(E + 1, dtype=np.int32) * NJ,
+            dtype=wp.int32, device=device,
+        )
+
+        # body_world: all zeros (all bodies share gravity[0] = zero)
+        self._bworld_b = wp.zeros(E * NB, dtype=wp.int32, device=device)
+
+        # ---- tile inertial arrays (env-independent — use env-0 values) ---- #
+        bIm_np = self.body_I_m.numpy()                             # (NB, 6, 6)
+        self._bIm_b = wp.array(
+            np.tile(bIm_np, (E, 1, 1)).reshape(-1, 6, 6),
+            dtype=wp.spatial_matrix, device=device,
+        )
+
+        bXcom_np = self.body_X_com.numpy()                         # (NB, 7)
+        self._bXcom_b = wp.array(
+            np.tile(bXcom_np, (E, 1)).reshape(-1, 7),
+            dtype=wp.transform, device=device,
+        )
+
+        # ---- tile limit / spring arrays ----------------------------------- #
+        self._jlim_lo_b = wp.array(
+            np.tile(self._joint_limit_lower.numpy(), E),
+            dtype=wp.float32, device=device,
+        )
+        self._jlim_hi_b = wp.array(
+            np.tile(self._joint_limit_upper.numpy(), E),
+            dtype=wp.float32, device=device,
+        )
+        self._jlim_ke_b = wp.array(
+            np.tile(self._joint_limit_ke.numpy(), E),
+            dtype=wp.float32, device=device,
+        )
+        self._jlim_kd_b = wp.array(
+            np.tile(self._joint_limit_kd.numpy(), E),
+            dtype=wp.float32, device=device,
+        )
+
+        # ---- batched joint-state work tensors ----------------------------- #
+        # Flat 1-D tensors; 2-D views share storage for easy env-wise filling.
+        self._q_work_b  = torch.zeros(E * total_q,  dtype=torch.float32, device=self._device)
+        self._qd_work_b = torch.zeros(E * total_qd, dtype=torch.float32, device=self._device)
+        self._q_work_b2d  = self._q_work_b.view(E, total_q)
+        self._qd_work_b2d = self._qd_work_b.view(E, total_qd)
+
+        # Persistent Warp views — updated in-place by compute_all_wrenches.
+        self._jq_b_wp  = wp.from_torch(self._q_work_b,  dtype=wp.float32)
+        self._jqd_b_wp = wp.from_torch(self._qd_work_b, dtype=wp.float32)
+
+        # ---- batched working buffers (one slot per env) ------------------- #
+        self._jS_b    = wp.empty((E * total_qd,), dtype=wp.spatial_vector, device=device)
+        self._bIs_b   = wp.empty((E * NB,),       dtype=wp.spatial_matrix, device=device)
+        self._bv_b    = wp.empty((E * NB,),       dtype=wp.spatial_vector, device=device)
+        self._bf_b    = wp.zeros((E * NB,),       dtype=wp.spatial_vector, device=device)
+        self._ba_b    = wp.empty((E * NB,),       dtype=wp.spatial_vector, device=device)
+        self._bft_b   = wp.zeros((E * NB,),       dtype=wp.spatial_vector, device=device)
+        self._bq_b    = wp.empty((E * NB,),       dtype=wp.transform,      device=device)
+        self._bqcom_b = wp.empty((E * NB,),       dtype=wp.transform,      device=device)
+        self._jtau_b  = wp.empty((E * total_qd,), dtype=wp.float32,        device=device)
+
+        self._jf_zero_b      = wp.zeros((E * total_qd,), dtype=wp.float32, device=device)
+        self._jtgt_zero_b    = wp.zeros((E * total_qd,), dtype=wp.float32, device=device)
+        self._jke_zero_b     = wp.zeros((E * total_qd,), dtype=wp.float32, device=device)
 
     # ---------------------------------------------------------------------- #
 
@@ -661,3 +795,158 @@ class ArmWrenchPredictor:
         )
 
         return self.joint_tau  # [0:6] = root free-joint = drone wrench
+
+    # ---------------------------------------------------------------------- #
+
+    def compute_all_wrenches(
+        self,
+        target: torch.Tensor,
+        mode: InputMode = InputMode.ACCEL,
+    ) -> torch.Tensor:
+        """
+        Compute the 6D wrench for **all** environments in a single GPU kernel
+        launch by tiling the topology arrays across environments.
+
+        Args:
+            target: Desired arm-joint motion for all environments.
+                    Shape ``(num_envs, num_arm_joints)`` for ``ACCEL``/``VEL``/``POS``,
+                    or ``(num_arm_joints,)`` to broadcast the same target to
+                    every environment.
+            mode:   Interpretation of ``target`` (same as ``compute_root_wrench``).
+
+        Returns:
+            ``torch.Tensor`` of shape ``(num_envs, total_qd)``.
+            Column ``[:, 0:6]`` is the 6D wrench at the root free-joint for
+            each environment.  Negate to obtain the feedforward compensation.
+        """
+        topo   = self._topo
+        device = self._device
+        E      = self._num_envs
+        dt     = self._dt
+
+        arm_q_all  = self._joint_pos_buf[:, self._joint_ids]   # (E, num_arm_joints)
+        arm_qd_all = self._joint_vel_buf[:, self._joint_ids]   # (E, num_arm_joints)
+
+        # ---- Broadcast scalar target if needed ----------------------------- #
+        if target.dim() == 1:
+            target = target.unsqueeze(0).expand(E, -1)          # (E, num_arm_joints)
+
+        # ---- Derive qdd from chosen mode ----------------------------------- #
+        if mode is InputMode.ACCEL:
+            pass   # target already holds qdd — not forwarded to kernel yet
+        elif mode is InputMode.VEL:
+            target = (target - arm_qd_all) / dt
+        elif mode is InputMode.POS:
+            target = 2.0 * (target - arm_q_all - arm_qd_all * dt) / (dt * dt)
+        else:
+            raise ValueError(f"Unknown InputMode: {mode}")
+
+        # ---- Fill batched joint-state work tensors in-place (no alloc) ----- #
+        q2d  = self._q_work_b2d   # (E, total_q)  — shares storage with Warp view
+        qd2d = self._qd_work_b2d  # (E, total_qd) — shares storage with Warp view
+
+        if not topo.is_fixed_base:
+            root_pose = self._root_pose_buf   # (E, 7) pos + quat(w,x,y,z)
+            root_vel  = self._root_vel_buf    # (E, 6) lin + ang
+
+            q2d[:, 0:3] = root_pose[:, 0:3]          # position
+            q2d[:, 3:6] = root_pose[:, 4:7]          # quat xyz  (w,x,y,z → x,y,z,w)
+            q2d[:, 6]   = root_pose[:, 3]             # quat w
+            q2d[:, 7:]  = arm_q_all
+
+            qd2d[:, 0:6] = root_vel
+            qd2d[:, 6:]  = arm_qd_all
+        else:
+            q2d[:]  = arm_q_all
+            qd2d[:] = arm_qd_all
+
+        # ---- 1. Forward kinematics (all envs) ------------------------------ #
+        wp.launch(
+            eval_rigid_fk,
+            dim=E,
+            inputs=[
+                self._art_start_b,
+                self._jtype_b,
+                self._jparent_b,
+                self._jchild_b,
+                self._jqs_b,
+                self._jqds_b,
+                self._jq_b_wp,
+                self._jXp_b,
+                self._jXc_b,
+                self._bXcom_b,
+                self._jaxis_b,
+                self._jdof_b,
+            ],
+            outputs=[self._bq_b, self._bqcom_b],
+            device=device,
+        )
+
+        # ---- 2. RNEA forward pass (Coriolis / centrifugal bias, all envs) -- #
+        self._bf_b.zero_()
+        wp.launch(
+            eval_rigid_id,
+            dim=E,
+            inputs=[
+                self._art_start_b,
+                self._jtype_b,
+                self._jparent_b,
+                self._jchild_b,
+                self._jqds_b,
+                self._jqd_b_wp,
+                self._jaxis_b,
+                self._jdof_b,
+                self._bIm_b,
+                self._bq_b,
+                self._bqcom_b,
+                self._jXp_b,
+                self._bworld_b,
+                self.gravity_zero,
+            ],
+            outputs=[
+                self._jS_b,
+                self._bIs_b,
+                self._bv_b,
+                self._bf_b,
+                self._ba_b,
+            ],
+            device=device,
+        )
+
+        # ---- 3. RNEA backward pass (all envs) ------------------------------ #
+        self._bft_b.zero_()
+        wp.launch(
+            eval_rigid_tau,
+            dim=E,
+            inputs=[
+                self._art_start_b,
+                self._jtype_b,
+                self._jparent_b,
+                self._jchild_b,
+                self._jqs_b,
+                self._jqds_b,
+                self._jdof_b,
+                self._jtgt_zero_b,
+                self._jtgt_zero_b,
+                self._jq_b_wp,
+                self._jqd_b_wp,
+                self._jf_zero_b,
+                self._jke_zero_b,
+                self._jke_zero_b,
+                self._jlim_lo_b,
+                self._jlim_hi_b,
+                self._jlim_ke_b,
+                self._jlim_kd_b,
+                self._jS_b,
+                self._bf_b,
+                None,
+            ],
+            outputs=[
+                self._bft_b,
+                self._jtau_b,
+            ],
+            device=device,
+        )
+
+        # Return as (num_envs, total_qd) torch tensor — zero-copy view.
+        return wp.to_torch(self._jtau_b).view(E, topo.total_qd)

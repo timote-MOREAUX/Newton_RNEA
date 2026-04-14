@@ -99,10 +99,29 @@ wrench = predictor.compute_root_wrench(pos_target, mode=InputMode.POS)
 
 ### Batched environments
 
-Pass `env_idx` to select which parallel environment to use:
+Pass `env_idx` to select a single parallel environment:
 
 ```python
 wrench = predictor.compute_root_wrench(joint_qdd, env_idx=3)
+```
+
+### All environments at once
+
+`compute_all_wrenches` runs a single GPU kernel launch across every environment — no Python loop:
+
+```python
+# joint_qdd shape: (num_envs, num_arm_joints)
+wrenches = predictor.compute_all_wrenches(joint_qdd, mode=InputMode.ACCEL)
+# wrenches: torch.Tensor of shape (num_envs, total_qd)
+
+feedforward_compensation = -wrenches[:, 0:6]  # (num_envs, 6)
+```
+
+A 1-D target is broadcast to all environments:
+
+```python
+shared_target = torch.zeros(6, device=env.device)
+wrenches = predictor.compute_all_wrenches(shared_target, mode=InputMode.VEL)
 ```
 
 ---
@@ -123,17 +142,21 @@ For floating-base robots (drone + arm) a synthetic **FREE joint** is prepended
 as joint 0 (world → drone root), since PhysX does not expose the root 6-DOF as
 a joint prim in USD.
 
-### Per-call (`compute_root_wrench`)
+### Per-call (`compute_root_wrench` / `compute_all_wrenches`)
 
 1. Root pose and arm joint state are copied in-place into pre-allocated torch
-   tensors (`_q_work`, `_qd_work`). Persistent Warp views over those tensors
-   are passed to the kernels — no `wp.from_torch` call per step.
+   tensors. Persistent Warp views over those tensors are passed to the kernels
+   — no `wp.from_torch` call per step.
 2. **FK** (`eval_rigid_fk`) — computes world-frame body transforms from joint
    positions.
 3. **RNEA forward pass** (`eval_rigid_id`) — propagates spatial velocities and
    computes Coriolis/centrifugal bias forces. Gravity is set to zero.
 4. **RNEA backward pass** (`eval_rigid_tau`) — propagates wrenches back to
    joint torques. `joint_tau[0:6]` is the wrench at the root free-joint.
+
+`compute_all_wrenches` tiles the topology arrays across all environments at
+init time (`_setup_batched`) so that all three kernel launches run with
+`dim=num_envs` — a single GPU dispatch per pass with no Python loop.
 
 ### Quaternion convention
 
