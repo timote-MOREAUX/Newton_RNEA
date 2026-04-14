@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import dataclasses
 from typing import TYPE_CHECKING
 
@@ -12,8 +11,8 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv       # type: ignore[import-untyped]
     from isaaclab.managers import SceneEntityCfg       # type: ignore[import-untyped]
 
-from src.enums import InputMode, JointType
-from src.kernels import (
+from .enums import InputMode, JointType
+from .kernels import (
     eval_rigid_fk,
     eval_rigid_id,
     eval_rigid_tau,
@@ -48,6 +47,8 @@ class _Topology:
     is_fixed_base:      bool
     # IsaacLab body indices actually used (sorted).  Used to slice inertial data.
     body_ids:           list[int]
+    # IsaacLab dof indices of the selected joints.  Used to slice joint_pos/vel.
+    joint_ids:          list[int] | slice
 
 
 def _gf_quat_to_xyzw(q) -> tuple[float, float, float, float]:
@@ -60,64 +61,70 @@ def _axis_token_to_vec3(token: str) -> tuple[float, float, float]:
     return {"X": (1., 0., 0.), "Y": (0., 1., 0.), "Z": (0., 0., 1.)}[token.upper()]
 
 
-def _resolve_art_prim(articulation, stage):
-    """Return the USD Prim for the first env instance of the articulation."""
-    from pxr import Usd
-
-    # Preferred: physics view exposes resolved per-env paths.
-    try:
-        path = articulation.root_physx_view.prim_paths[0]
-        prim = stage.GetPrimAtPath(path)
-        if prim.IsValid():
-            return prim
-    except (AttributeError, IndexError, TypeError):
-        pass
-
-    # Fallback: replace IsaacLab env regex tokens with "env_0".
-    pattern = articulation.cfg.prim_path
-    concrete = re.sub(r'\.\*|\{ENV_REGEX_NS\}', 'env_0', pattern)
-    prim = stage.GetPrimAtPath(concrete)
-    if prim.IsValid():
-        return prim
-
-    raise RuntimeError(
-        f"Cannot resolve articulation USD prim from path '{pattern}'. "
-        "Ensure env_0 exists in the stage or that root_physx_view.prim_paths is available."
-    )
-
-
 def _build_topology(
     articulation,
-    stage,
     device: str,
-    joint_name_filter: list[str] | None = None,
+    entity_cfg=None,
 ) -> _Topology:
     """
-    Traverse the USD stage once to extract the kinematic structure needed by
-    the Newton RNEA kernels and return them as Warp arrays on ``device``.
+    Parse the USD stage once to extract the kinematic structure needed by the
+    Newton RNEA kernels and return them as Warp arrays on ``device``.
+
+    The stage is obtained from ``omni.usd`` internally.  Joint selection is
+    resolved via ``articulation.find_joints`` so that ``entity_cfg.joint_names``
+    regex patterns are handled by IsaacLab rather than hand-rolled logic.
+
+    Kinematic structure (parent/child relationships, joint frame offsets, joint
+    axes) is not exposed by the ``Articulation`` class and must be read from
+    USD.  All runtime state (joint positions/velocities, inertia) comes from
+    ``Articulation.data`` in the caller.
 
     Args:
-        articulation:       IsaacLab ``Articulation`` object.
-        stage:              Live USD stage (from ``omni.usd.get_context().get_stage()``).
-        device:             Warp / torch device string.
-        joint_name_filter:  Subset of ``articulation.joint_names`` to include.
-                            ``None`` → use all joints.  The filter is matched by
-                            exact name (after ``SceneEntityCfg.resolve()`` the names
-                            are already concrete).
+        articulation:  IsaacLab ``Articulation`` object (already resolved).
+        device:        Warp / torch device string.
+        entity_cfg:    ``SceneEntityCfg`` (already resolved).  ``None`` → use
+                       all joints.
     """
-    from pxr import UsdPhysics, Gf, Usd
+    import omni.usd  # type: ignore[import-untyped]
+    from pxr import UsdPhysics, UsdGeom, Gf, Usd
 
-    all_body_names  = list(articulation.body_names)
-    all_joint_names = list(articulation.joint_names)
+    stage = omni.usd.get_context().get_stage()
+
+    all_body_names = list(articulation.body_names)
 
     # Full body-name → IsaacLab body index (used during USD prim lookup).
     full_body_idx = {name: i for i, name in enumerate(all_body_names)}
 
-    # Which arm joints to include in the kinematic tree.
-    joint_names = joint_name_filter if joint_name_filter is not None else all_joint_names
+    # Resolve which joints to include using IsaacLab's find_joints so that
+    # regex patterns in entity_cfg.joint_names are handled natively.
+    if entity_cfg is None or entity_cfg.joint_names is None:
+        joint_ids:   list[int] | slice = slice(None)
+        joint_names: list[str]         = list(articulation.joint_names)
+    else:
+        joint_ids, joint_names = articulation.find_joints(entity_cfg.joint_names)
 
-    art_prim = _resolve_art_prim(articulation, stage)
-    meters_per_unit = float(Usd.Stage.GetMetersPerUnit(stage))
+    # Resolve the articulation USD prim (first env instance).
+    art_prim = None
+    try:
+        path = articulation.root_physx_view.prim_paths[0]
+        art_prim = stage.GetPrimAtPath(path)
+        if not art_prim.IsValid():
+            art_prim = None
+    except (AttributeError, IndexError, TypeError):
+        pass
+
+    if art_prim is None:
+        import re as _re
+        pattern  = articulation.cfg.prim_path
+        concrete = _re.sub(r'\.\*|\{ENV_REGEX_NS\}', 'env_0', pattern)
+        art_prim = stage.GetPrimAtPath(concrete)
+        if not art_prim.IsValid():
+            raise RuntimeError(
+                f"Cannot resolve articulation USD prim from '{pattern}'. "
+                "Ensure env_0 exists or root_physx_view.prim_paths is available."
+            )
+
+    meters_per_unit = float(UsdGeom.GetStageMetersPerUnit(stage))
 
     # ------------------------------------------------------------------ #
     # Collect all USD joint prims under the articulation root prim.        #
@@ -288,6 +295,7 @@ def _build_topology(
         num_joints         = num_joints_total,
         is_fixed_base      = is_fixed_base,
         body_ids           = body_ids,
+        joint_ids          = joint_ids,
     )
 
 
@@ -348,39 +356,24 @@ class ArmWrenchPredictor:
                              backward pass (default 0 = no limit forces).
             joint_limit_kd:  Damping for joint-limit enforcement (default 0).
         """
-        import omni.usd  # type: ignore[import-untyped]
-
         self._device: str   = env.device
         self._dt:     float = env.physics_dt
         device              = self._device
 
         # ------------------------------------------------------------------ #
-        # Resolve cfg → get articulation + joint / body index arrays.         #
-        # Mirrors what IsaacLab MDP action terms do in their __init__.        #
+        # Resolve cfg → articulation, then build kinematic topology.          #
         # ------------------------------------------------------------------ #
         entity_cfg.resolve(env.scene)
         articulation = env.scene[entity_cfg.name]
         self.articulation = articulation
 
-        # joint_ids: slice(None) (all) or list[int] of selected dof indices.
-        # Used to slice data.joint_pos / data.joint_vel each call.
-        self._joint_ids = entity_cfg.joint_ids
-
-        # Derive concrete joint names for the topology filter.
-        all_joint_names = list(articulation.joint_names)
-        if isinstance(entity_cfg.joint_ids, slice):
-            joint_name_filter = None  # use all joints
-        else:
-            joint_name_filter = [all_joint_names[i] for i in entity_cfg.joint_ids]
-
         data = articulation.data
 
-        # ------------------------------------------------------------------ #
-        # Parse USD stage once → kinematic topology as Warp arrays.           #
-        # ------------------------------------------------------------------ #
-        stage = omni.usd.get_context().get_stage()
-        topo  = _build_topology(articulation, stage, device, joint_name_filter)
-        self._topo = topo
+        # _build_topology resolves joint names via articulation.find_joints
+        # and stores the resulting dof indices in topo.joint_ids.
+        topo  = _build_topology(articulation, device, entity_cfg)
+        self._topo      = topo
+        self._joint_ids = topo.joint_ids   # list[int] | slice — runtime slicing
 
         num_bodies = len(topo.body_ids)   # only the bodies used by the arm
         root_dofs  = 0 if topo.is_fixed_base else 6
