@@ -1,6 +1,6 @@
 import warp as wp
 
-from src.enums import JointType
+from .enums import JointType
 
 @wp.func
 def compute_2d_rotational_dofs(
