@@ -1,0 +1,663 @@
+from __future__ import annotations
+
+import re
+import dataclasses
+from typing import TYPE_CHECKING
+
+import numpy as np
+import torch
+import warp as wp
+
+if TYPE_CHECKING:
+    from isaaclab.envs import ManagerBasedRLEnv       # type: ignore[import-untyped]
+    from isaaclab.managers import SceneEntityCfg       # type: ignore[import-untyped]
+
+from src.enums import InputMode, JointType
+from src.kernels import (
+    eval_rigid_fk,
+    eval_rigid_id,
+    eval_rigid_tau,
+    compute_spatial_inertia,
+    compute_com_transforms,
+)
+
+
+# --------------------------------------------------------------------------- #
+# USD topology extraction                                                       #
+# --------------------------------------------------------------------------- #
+
+@dataclasses.dataclass
+class _Topology:
+    """All static kinematic data needed by the RNEA kernels, as Warp arrays."""
+    joint_type:         wp.array   # (num_joints,)      int32
+    joint_parent:       wp.array   # (num_joints,)      int32  — -1 = world
+    joint_child:        wp.array   # (num_joints,)      int32
+    joint_X_p:          wp.array   # (num_joints,)      wp.transform
+    joint_X_c:          wp.array   # (num_joints,)      wp.transform
+    joint_axis:         wp.array   # (total_qd,)        wp.vec3
+    joint_dof_dim:      wp.array   # (num_joints, 2)    int32  — [lin, ang]
+    joint_q_start:      wp.array   # (num_joints,)      int32
+    joint_qd_start:     wp.array   # (num_joints,)      int32
+    articulation_start: wp.array   # (2,)               int32  — [0, num_joints]
+    # body_world[i] = index into the gravity array for body i.
+    # We pass a single-element zero-gravity array, so every body must index 0.
+    body_world:         wp.array   # (num_bodies,)      int32  — all zeros
+    total_q:            int        # total position coords  (len of joint_q vector)
+    total_qd:           int        # total velocity dofs    (len of joint_qd vector)
+    num_joints:         int
+    is_fixed_base:      bool
+    # IsaacLab body indices actually used (sorted).  Used to slice inertial data.
+    body_ids:           list[int]
+
+
+def _gf_quat_to_xyzw(q) -> tuple[float, float, float, float]:
+    """Gf.Quatf / Gf.Quatd (real, imaginary) → (x, y, z, w) for wp.quat."""
+    i = q.GetImaginary()
+    return float(i[0]), float(i[1]), float(i[2]), float(q.GetReal())
+
+
+def _axis_token_to_vec3(token: str) -> tuple[float, float, float]:
+    return {"X": (1., 0., 0.), "Y": (0., 1., 0.), "Z": (0., 0., 1.)}[token.upper()]
+
+
+def _resolve_art_prim(articulation, stage):
+    """Return the USD Prim for the first env instance of the articulation."""
+    from pxr import Usd
+
+    # Preferred: physics view exposes resolved per-env paths.
+    try:
+        path = articulation.root_physx_view.prim_paths[0]
+        prim = stage.GetPrimAtPath(path)
+        if prim.IsValid():
+            return prim
+    except (AttributeError, IndexError, TypeError):
+        pass
+
+    # Fallback: replace IsaacLab env regex tokens with "env_0".
+    pattern = articulation.cfg.prim_path
+    concrete = re.sub(r'\.\*|\{ENV_REGEX_NS\}', 'env_0', pattern)
+    prim = stage.GetPrimAtPath(concrete)
+    if prim.IsValid():
+        return prim
+
+    raise RuntimeError(
+        f"Cannot resolve articulation USD prim from path '{pattern}'. "
+        "Ensure env_0 exists in the stage or that root_physx_view.prim_paths is available."
+    )
+
+
+def _build_topology(
+    articulation,
+    stage,
+    device: str,
+    joint_name_filter: list[str] | None = None,
+) -> _Topology:
+    """
+    Traverse the USD stage once to extract the kinematic structure needed by
+    the Newton RNEA kernels and return them as Warp arrays on ``device``.
+
+    Args:
+        articulation:       IsaacLab ``Articulation`` object.
+        stage:              Live USD stage (from ``omni.usd.get_context().get_stage()``).
+        device:             Warp / torch device string.
+        joint_name_filter:  Subset of ``articulation.joint_names`` to include.
+                            ``None`` → use all joints.  The filter is matched by
+                            exact name (after ``SceneEntityCfg.resolve()`` the names
+                            are already concrete).
+    """
+    from pxr import UsdPhysics, Gf, Usd
+
+    all_body_names  = list(articulation.body_names)
+    all_joint_names = list(articulation.joint_names)
+
+    # Full body-name → IsaacLab body index (used during USD prim lookup).
+    full_body_idx = {name: i for i, name in enumerate(all_body_names)}
+
+    # Which arm joints to include in the kinematic tree.
+    joint_names = joint_name_filter if joint_name_filter is not None else all_joint_names
+
+    art_prim = _resolve_art_prim(articulation, stage)
+    meters_per_unit = float(Usd.Stage.GetMetersPerUnit(stage))
+
+    # ------------------------------------------------------------------ #
+    # Collect all USD joint prims under the articulation root prim.        #
+    # ------------------------------------------------------------------ #
+    usd_joints: dict[str, Usd.Prim] = {}
+    for prim in Usd.PrimRange(art_prim):
+        if (prim.IsA(UsdPhysics.RevoluteJoint) or
+                prim.IsA(UsdPhysics.PrismaticJoint) or
+                prim.IsA(UsdPhysics.FixedJoint) or
+                prim.IsA(UsdPhysics.SphericalJoint)):
+            usd_joints[prim.GetName()] = prim
+
+    # ------------------------------------------------------------------ #
+    # Fixed-base: a FixedJoint with no body0 is welded to the world.      #
+    # ------------------------------------------------------------------ #
+    is_fixed_base = any(
+        not prim.GetRelationship("physics:body0").GetTargets()
+        for prim in Usd.PrimRange(art_prim)
+        if prim.IsA(UsdPhysics.FixedJoint)
+    )
+
+    # ------------------------------------------------------------------ #
+    # Parse USD joints → collect raw (full IsaacLab) parent/child indices. #
+    # We store full indices first, then remap to contiguous Newton indices  #
+    # once we know which bodies are actually used.                          #
+    # ------------------------------------------------------------------ #
+    jtype_raw:    list[int]               = []
+    parent_raw:   list[int]               = []  # full IsaacLab body indices
+    child_raw:    list[int]               = []  # full IsaacLab body indices
+    X_p_raw:      list[wp.transform]      = []
+    X_c_raw:      list[wp.transform]      = []
+    dof_dim_raw:  list[list[int]]         = []
+    axis_entries: list[tuple[int, tuple]] = []  # (dof_idx, (x,y,z))
+
+    q_cursor = qd_cursor = 0
+    q_starts:  list[int] = []
+    qd_starts: list[int] = []
+
+    def _register(jtype: JointType, lin: int, ang: int,
+                  par_full: int, chi_full: int,
+                  X_p: wp.transform, X_c: wp.transform,
+                  axes: list[tuple[float, float, float]]):
+        nonlocal q_cursor, qd_cursor
+        jtype_raw.append(int(jtype))
+        parent_raw.append(par_full)
+        child_raw.append(chi_full)
+        X_p_raw.append(X_p)
+        X_c_raw.append(X_c)
+        dof_dim_raw.append([lin, ang])
+        q_starts.append(q_cursor)
+        qd_starts.append(qd_cursor)
+        for k, ax in enumerate(axes):
+            axis_entries.append((qd_cursor + k, ax))
+        dof_qd, dof_q = jtype.dof_count(lin + ang)
+        q_cursor  += dof_q
+        qd_cursor += dof_qd
+
+    # --- Synthetic root FREE joint (floating-base only) ------------------ #
+    if not is_fixed_base:
+        # Body 0 is always the root in IsaacLab's body ordering.
+        # FREE joint axes are hardcoded in the kernel; no axis_entries needed.
+        _register(JointType.FREE, 3, 3, -1, 0, wp.transform(), wp.transform(), [])
+
+    # --- USD arm joints -------------------------------------------------- #
+    def _get_transform(prim, pos_attr: str, rot_attr: str) -> wp.transform:
+        pos = prim.GetAttribute(pos_attr).Get() or Gf.Vec3f(0.)
+        rot = (prim.GetAttribute(rot_attr).Get() or Gf.Quatf(1.)).GetNormalized()
+        s = meters_per_unit
+        p = wp.vec3(float(pos[0]) * s, float(pos[1]) * s, float(pos[2]) * s)
+        q = wp.quat(*_gf_quat_to_xyzw(rot))
+        return wp.transform(p, q)
+
+    for jname in joint_names:
+        prim = usd_joints.get(jname)
+        if prim is None:
+            # Partial-name fallback (handles prefix/suffix differences).
+            matches = [p for n, p in usd_joints.items()
+                       if n.endswith(jname) or jname.endswith(n)]
+            if len(matches) == 1:
+                prim = matches[0]
+            else:
+                raise RuntimeError(
+                    f"Joint '{jname}' not found under '{art_prim.GetPath()}'. "
+                    f"Available USD joints: {list(usd_joints.keys())}"
+                )
+
+        # Joint type
+        if prim.IsA(UsdPhysics.RevoluteJoint):
+            jt, lin, ang = JointType.REVOLUTE,  0, 1
+        elif prim.IsA(UsdPhysics.PrismaticJoint):
+            jt, lin, ang = JointType.PRISMATIC, 1, 0
+        elif prim.IsA(UsdPhysics.FixedJoint):
+            jt, lin, ang = JointType.FIXED,     0, 0
+        elif prim.IsA(UsdPhysics.SphericalJoint):
+            jt, lin, ang = JointType.BALL,      0, 3
+        else:
+            raise RuntimeError(f"Unsupported USD joint type for '{jname}'")
+
+        # Parent / child — full IsaacLab body indices.
+        b0 = prim.GetRelationship("physics:body0").GetTargets()
+        b1 = prim.GetRelationship("physics:body1").GetTargets()
+        b0_name = str(b0[0]).split("/")[-1] if b0 else None
+        b1_name = str(b1[0]).split("/")[-1]
+        par_full = full_body_idx.get(b0_name, -1) if b0_name else -1
+        chi_full = full_body_idx[b1_name]
+
+        X_p = _get_transform(prim, "physics:localPos0", "physics:localRot0")
+        X_c = _get_transform(prim, "physics:localPos1", "physics:localRot1")
+
+        axes: list[tuple[float, float, float]] = []
+        if jt in (JointType.REVOLUTE, JointType.PRISMATIC):
+            tok = prim.GetAttribute("physics:axis").Get() or "X"
+            axes = [_axis_token_to_vec3(tok)]
+
+        _register(jt, lin, ang, par_full, chi_full, X_p, X_c, axes)
+
+    # ------------------------------------------------------------------ #
+    # Body set: root (always) + all parents + all children referenced by  #
+    # the selected joints.  Bodies not in this set are excluded from the   #
+    # Newton model (their inertia, buffers, etc. are not allocated).       #
+    # ------------------------------------------------------------------ #
+    body_set: set[int] = {0}  # root body is always index 0 in IsaacLab
+    for p, c in zip(parent_raw, child_raw):
+        if p >= 0:
+            body_set.add(p)
+        body_set.add(c)
+
+    body_ids = sorted(body_set)                              # IsaacLab indices, ascending
+    body_remap = {old: new for new, old in enumerate(body_ids)}  # full → Newton index
+
+    # Remap parent / child to contiguous Newton body indices.
+    parent_list = [body_remap.get(p, -1) if p >= 0 else -1 for p in parent_raw]
+    child_list  = [body_remap[c] for c in child_raw]
+    num_bodies_used = len(body_ids)
+
+    # ------------------------------------------------------------------ #
+    # Assemble joint_axis indexed by DoF position.                         #
+    # ------------------------------------------------------------------ #
+    axis_np = np.zeros((qd_cursor, 3), dtype=np.float32)
+    for dof_idx, (ax0, ax1, ax2) in axis_entries:
+        axis_np[dof_idx] = [ax0, ax1, ax2]
+
+    # ------------------------------------------------------------------ #
+    # Convert to Warp arrays.                                              #
+    # ------------------------------------------------------------------ #
+    def _wi(lst: list[int]) -> wp.array:
+        return wp.array(np.array(lst, dtype=np.int32), dtype=wp.int32, device=device)
+
+    num_joints_total = len(jtype_raw)
+
+    return _Topology(
+        joint_type         = _wi(jtype_raw),
+        joint_parent       = _wi(parent_list),
+        joint_child        = _wi(child_list),
+        joint_X_p          = wp.array(X_p_raw,  dtype=wp.transform, device=device),
+        joint_X_c          = wp.array(X_c_raw,  dtype=wp.transform, device=device),
+        joint_axis         = wp.array([wp.vec3(*r) for r in axis_np],
+                                      dtype=wp.vec3, device=device),
+        joint_dof_dim      = wp.array(np.array(dof_dim_raw, dtype=np.int32),
+                                      dtype=wp.int32, ndim=2, device=device),
+        joint_q_start      = _wi(q_starts),
+        joint_qd_start     = _wi(qd_starts),
+        articulation_start = _wi([0, num_joints_total]),
+        # All bodies index into gravity[0] = zero vector.
+        body_world         = wp.zeros((num_bodies_used,), dtype=wp.int32, device=device),
+        total_q            = q_cursor,
+        total_qd           = qd_cursor,
+        num_joints         = num_joints_total,
+        is_fixed_base      = is_fixed_base,
+        body_ids           = body_ids,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Predictor                                                                     #
+# --------------------------------------------------------------------------- #
+
+class ArmWrenchPredictor:
+    """
+    Computes the 6D wrench the arm exerts on the drone root body given planned
+    joint motion.  No gravity, no contacts, no integration — pure RNEA.
+
+    The articulation and joint subset are specified via an IsaacLab
+    ``SceneEntityCfg``, exactly as in MDP action / observation terms.  This
+    lets you target only the arm joints of a larger articulation (e.g. a
+    drone that also has propeller or leg joints).
+
+    Example
+    -------
+    .. code-block:: python
+
+        from isaaclab.managers import SceneEntityCfg
+        from src import ArmWrenchPredictor, InputMode
+
+        entity_cfg = SceneEntityCfg("robot", joint_names=["arm_joint_.*"])
+        predictor = ArmWrenchPredictor(env, entity_cfg)
+
+        wrench = predictor.compute_root_wrench(pos_target, mode=InputMode.POS)
+        feedforward = -wp.to_torch(wrench)[:6]
+
+    Topology (joint types, parent/child tree, axes, frame offsets) is parsed
+    from the USD stage once at construction.  Runtime state is read from
+    ``Articulation.data`` each call through persistent, pre-allocated Warp
+    views — zero per-call allocation.
+
+    Quaternion convention
+    ---------------------
+    Isaac Lab uses ``(w, x, y, z)``; Newton/Warp kernels use ``(x, y, z, w)``.
+    The root pose is reordered in-place before each kernel launch.
+    """
+
+    def __init__(
+        self,
+        env: ManagerBasedRLEnv,
+        entity_cfg: SceneEntityCfg,
+        joint_limit_ke: float = 0.0,
+        joint_limit_kd: float = 0.0,
+    ):
+        """
+        Args:
+            env:             ``ManagerBasedRLEnv`` — provides device and physics dt.
+            entity_cfg:         ``SceneEntityCfg`` naming the articulation and
+                             optionally filtering joints/bodies with regex patterns
+                             (same convention as IsaacLab MDP action/obs terms).
+                             The cfg is resolved here; pass it *before* or
+                             *after* calling ``resolve()`` — both work.
+            joint_limit_ke:  Spring stiffness for joint-limit enforcement in the RNEA
+                             backward pass (default 0 = no limit forces).
+            joint_limit_kd:  Damping for joint-limit enforcement (default 0).
+        """
+        import omni.usd  # type: ignore[import-untyped]
+
+        self._device: str   = env.device
+        self._dt:     float = env.physics_dt
+        device              = self._device
+
+        # ------------------------------------------------------------------ #
+        # Resolve cfg → get articulation + joint / body index arrays.         #
+        # Mirrors what IsaacLab MDP action terms do in their __init__.        #
+        # ------------------------------------------------------------------ #
+        entity_cfg.resolve(env.scene)
+        articulation = env.scene[entity_cfg.name]
+        self.articulation = articulation
+
+        # joint_ids: slice(None) (all) or list[int] of selected dof indices.
+        # Used to slice data.joint_pos / data.joint_vel each call.
+        self._joint_ids = entity_cfg.joint_ids
+
+        # Derive concrete joint names for the topology filter.
+        all_joint_names = list(articulation.joint_names)
+        if isinstance(entity_cfg.joint_ids, slice):
+            joint_name_filter = None  # use all joints
+        else:
+            joint_name_filter = [all_joint_names[i] for i in entity_cfg.joint_ids]
+
+        data = articulation.data
+
+        # ------------------------------------------------------------------ #
+        # Parse USD stage once → kinematic topology as Warp arrays.           #
+        # ------------------------------------------------------------------ #
+        stage = omni.usd.get_context().get_stage()
+        topo  = _build_topology(articulation, stage, device, joint_name_filter)
+        self._topo = topo
+
+        num_bodies = len(topo.body_ids)   # only the bodies used by the arm
+        root_dofs  = 0 if topo.is_fixed_base else 6
+
+        # ------------------------------------------------------------------ #
+        # Pre-allocated joint state work tensors (filled in-place per call).  #
+        # ------------------------------------------------------------------ #
+        self._q_work  = torch.zeros(topo.total_q,  dtype=torch.float32, device=device)
+        self._qd_work = torch.zeros(topo.total_qd, dtype=torch.float32, device=device)
+
+        # Persistent Warp views — no wp.from_torch inside compute_root_wrench.
+        # Passed only to kernel inputs (read-only); IsaacLab tensors are never
+        # written by the RNEA kernels.
+        self._joint_q_wp  = wp.from_torch(self._q_work,  dtype=wp.float32)
+        self._joint_qd_wp = wp.from_torch(self._qd_work, dtype=wp.float32)
+
+        # Live references to IsaacLab buffers (updated in-place each physics step).
+        self._joint_pos_buf = data.joint_pos   # (num_envs, total_dofs)
+        self._joint_vel_buf = data.joint_vel   # (num_envs, total_dofs)
+        if not topo.is_fixed_base:
+            self._root_pose_buf = data.root_link_pose_w  # (num_envs, 7) pos+quat(w,x,y,z)
+            self._root_vel_buf  = data.root_link_vel_w   # (num_envs, 6) lin+ang
+
+        # ------------------------------------------------------------------ #
+        # Static inertia tensors — slice to the arm bodies only.              #
+        # topo.body_ids holds the IsaacLab body indices actually used.        #
+        # default_mass   : (num_envs, all_bodies)                             #
+        # default_inertia: (num_envs, all_bodies, 9)  — row-major 3×3        #
+        # body_com_pose_b: (num_envs, all_bodies, 7)                         #
+        # ------------------------------------------------------------------ #
+        bids = topo.body_ids  # IsaacLab indices of the arm bodies
+
+        mass_wp = wp.from_torch(
+            data.default_mass[0, bids].contiguous(), dtype=wp.float32
+        )
+        inertia_wp = wp.from_torch(
+            data.default_inertia[0, bids].reshape(num_bodies, 3, 3).contiguous(),
+            dtype=wp.mat33,
+        )
+        self.body_I_m = wp.empty((num_bodies,), dtype=wp.spatial_matrix, device=device)
+        wp.launch(
+            compute_spatial_inertia,
+            num_bodies,
+            inputs=[inertia_wp, mass_wp],
+            outputs=[self.body_I_m],
+            device=device,
+        )
+
+        com_pos_wp = wp.from_torch(
+            data.body_com_pose_b[0, bids, :3].contiguous(), dtype=wp.vec3
+        )
+        self.body_X_com = wp.empty((num_bodies,), dtype=wp.transform, device=device)
+        wp.launch(
+            compute_com_transforms,
+            num_bodies,
+            inputs=[com_pos_wp],
+            outputs=[self.body_X_com],
+            device=device,
+        )
+
+        # ------------------------------------------------------------------ #
+        # Joint limits from IsaacLab.  ke/kd are not in the USD schema and   #
+        # default to 0 (no limit-spring forces in the RNEA backward pass).   #
+        # data.joint_pos_limits: (num_envs, total_dofs, 2)                   #
+        # ------------------------------------------------------------------ #
+        limits_np = np.empty((topo.total_qd, 2), dtype=np.float32)
+        if not topo.is_fixed_base:
+            limits_np[:root_dofs, 0] = -np.inf
+            limits_np[:root_dofs, 1] =  np.inf
+            limits_np[root_dofs:]    = data.joint_pos_limits[0, self._joint_ids].cpu().numpy()
+        else:
+            limits_np[:] = data.joint_pos_limits[0, self._joint_ids].cpu().numpy()
+
+        self._joint_limit_lower = wp.array(limits_np[:, 0], dtype=wp.float32, device=device)
+        self._joint_limit_upper = wp.array(limits_np[:, 1], dtype=wp.float32, device=device)
+        self._joint_limit_ke = wp.array(
+            np.full(topo.total_qd, joint_limit_ke, dtype=np.float32), dtype=wp.float32, device=device
+        )
+        self._joint_limit_kd = wp.array(
+            np.full(topo.total_qd, joint_limit_kd, dtype=np.float32), dtype=wp.float32, device=device
+        )
+
+        # ------------------------------------------------------------------ #
+        # Working buffers (reused every kernel call).                         #
+        # ------------------------------------------------------------------ #
+        self.joint_S_s  = wp.empty((topo.total_qd,), dtype=wp.spatial_vector, device=device)
+        self.body_I_s   = wp.empty((num_bodies,),    dtype=wp.spatial_matrix, device=device)
+        self.body_v_s   = wp.empty((num_bodies,),    dtype=wp.spatial_vector, device=device)
+        self.body_f_s   = wp.zeros((num_bodies,),    dtype=wp.spatial_vector, device=device)
+        self.body_a_s   = wp.empty((num_bodies,),    dtype=wp.spatial_vector, device=device)
+        self.body_ft_s  = wp.zeros((num_bodies,),    dtype=wp.spatial_vector, device=device)
+        self.body_q_com = wp.empty((num_bodies,),    dtype=wp.transform,      device=device)
+        self.body_q     = wp.empty((num_bodies,),    dtype=wp.transform,      device=device)
+        self.joint_tau  = wp.empty((topo.total_qd,), dtype=wp.float32,        device=device)
+
+        # Single-element zero-gravity array.  Must be wp.vec3 dtype because
+        # the kernel does `gravity[world_idx]` → wp.vec3.
+        self.gravity_zero      = wp.zeros((1,),             dtype=wp.vec3,    device=device)
+        self.joint_f_zero      = wp.zeros((topo.total_qd,), dtype=wp.float32, device=device)
+        self.joint_target_zero = wp.zeros((topo.total_qd,), dtype=wp.float32, device=device)
+        self.joint_ke_zero     = wp.zeros((topo.total_qd,), dtype=wp.float32, device=device)
+
+        self._root_dofs = root_dofs
+
+    # ---------------------------------------------------------------------- #
+
+    def compute_root_wrench(
+        self,
+        target: torch.Tensor | wp.array,
+        mode: InputMode = InputMode.ACCEL,
+        env_idx: int = 0,
+    ) -> wp.array:
+        """
+        Compute the 6D wrench the arm exerts on the drone root body.
+
+        Joint state is read from ``Articulation.data`` (sliced to the joints
+        selected by ``SceneEntityCfg``) and written into pre-allocated work
+        tensors — no allocation per call.
+
+        Args:
+            target:   Desired arm-joint motion.  Shape ``(num_arm_joints,)`` or
+                      ``(num_envs, num_arm_joints)`` where ``num_arm_joints``
+                      matches the joints resolved by ``SceneEntityCfg``.
+                      Accepts ``torch.Tensor`` for all modes; ``wp.array`` for
+                      ``ACCEL`` only.
+            mode:     Interpretation of ``target`` (default ``ACCEL``):
+
+                      * ``ACCEL`` — explicit joint accelerations.
+                      * ``VEL``   — desired joint velocities →
+                        ``qdd ≈ (vel_target − vel_curr) / dt``.
+                      * ``POS``   — desired joint positions →
+                        ``qdd = 2·(pos_target − pos_curr − vel·dt) / dt²``.
+            env_idx:  Which environment instance to read state from (default 0).
+
+        Returns:
+            ``joint_tau`` — Warp array of length ``total_qd``.
+            Elements ``[0:6]`` are the 6D wrench at the root free-joint for
+            floating-base systems.  Negate to obtain the feedforward
+            compensation wrench.
+
+        Note:
+            The RNEA kernels compute the Coriolis / centrifugal bias only.
+            The inertial ``M·qdd`` term is not yet wired into the kernel;
+            ``joint_qdd`` derived from ``target`` is computed but not forwarded.
+        """
+        topo   = self._topo
+        device = self._device
+
+        # Slice to only the joints selected by SceneEntityCfg.
+        arm_q  = self._joint_pos_buf[env_idx, self._joint_ids]
+        arm_qd = self._joint_vel_buf[env_idx, self._joint_ids]
+
+        # ---- Assemble full joint state in-place (no allocation) ----------- #
+        if not topo.is_fixed_base:
+            pose = self._root_pose_buf[env_idx]  # (7,) pos + quat(w,x,y,z)
+            vel  = self._root_vel_buf[env_idx]   # (6,) lin + ang
+
+            self._q_work[0:3] = pose[0:3]
+            # quat: IsaacLab (w,x,y,z) → Newton/Warp (x,y,z,w)
+            self._q_work[3]   = pose[4]
+            self._q_work[4]   = pose[5]
+            self._q_work[5]   = pose[6]
+            self._q_work[6]   = pose[3]
+            self._q_work[7:]  = arm_q
+
+            self._qd_work[0:6] = vel
+            self._qd_work[6:]  = arm_qd
+        else:
+            self._q_work[:]  = arm_q
+            self._qd_work[:] = arm_qd
+
+        # ---- Derive arm-joint qdd from the chosen input mode -------------- #
+        dt = self._dt
+
+        def _pick(t: torch.Tensor) -> torch.Tensor:
+            return t[env_idx] if t.dim() == 2 else t
+
+        if mode is InputMode.ACCEL:
+            arm_qdd: torch.Tensor | wp.array = (
+                _pick(target) if isinstance(target, torch.Tensor) else target
+            )
+        elif mode is InputMode.VEL:
+            arm_qdd = (_pick(target) - arm_qd) / dt
+        elif mode is InputMode.POS:
+            t = _pick(target)
+            arm_qdd = 2.0 * (t - arm_q - arm_qd * dt) / (dt * dt)
+        else:
+            raise ValueError(f"Unknown InputMode: {mode}")
+
+        del arm_qdd  # not consumed by current kernels; reserved for M·qdd extension
+
+        # ---- 1. Forward kinematics --------------------------------------- #
+        wp.launch(
+            eval_rigid_fk,
+            dim=topo.articulation_start.shape[0] - 1,
+            inputs=[
+                topo.articulation_start,
+                topo.joint_type,
+                topo.joint_parent,
+                topo.joint_child,
+                topo.joint_q_start,
+                topo.joint_qd_start,
+                self._joint_q_wp,
+                topo.joint_X_p,
+                topo.joint_X_c,
+                self.body_X_com,
+                topo.joint_axis,
+                topo.joint_dof_dim,
+            ],
+            outputs=[self.body_q, self.body_q_com],
+            device=device,
+        )
+
+        # ---- 2. RNEA forward pass (Coriolis / centrifugal bias) ---------- #
+        self.body_f_s.zero_()
+        wp.launch(
+            eval_rigid_id,
+            dim=topo.articulation_start.shape[0] - 1,
+            inputs=[
+                topo.articulation_start,
+                topo.joint_type,
+                topo.joint_parent,
+                topo.joint_child,
+                topo.joint_qd_start,
+                self._joint_qd_wp,
+                topo.joint_axis,
+                topo.joint_dof_dim,
+                self.body_I_m,
+                self.body_q,
+                self.body_q_com,
+                topo.joint_X_p,
+                topo.body_world,
+                self.gravity_zero,
+            ],
+            outputs=[
+                self.joint_S_s,
+                self.body_I_s,
+                self.body_v_s,
+                self.body_f_s,
+                self.body_a_s,
+            ],
+            device=device,
+        )
+
+        # ---- 3. RNEA backward pass --------------------------------------- #
+        self.body_ft_s.zero_()
+        wp.launch(
+            eval_rigid_tau,
+            dim=topo.articulation_start.shape[0] - 1,
+            inputs=[
+                topo.articulation_start,
+                topo.joint_type,
+                topo.joint_parent,
+                topo.joint_child,
+                topo.joint_q_start,
+                topo.joint_qd_start,
+                topo.joint_dof_dim,
+                self.joint_target_zero,
+                self.joint_target_zero,
+                self._joint_q_wp,
+                self._joint_qd_wp,
+                self.joint_f_zero,
+                self.joint_ke_zero,
+                self.joint_ke_zero,
+                self._joint_limit_lower,
+                self._joint_limit_upper,
+                self._joint_limit_ke,
+                self._joint_limit_kd,
+                self.joint_S_s,
+                self.body_f_s,
+                None,
+            ],
+            outputs=[
+                self.body_ft_s,
+                self.joint_tau,
+            ],
+            device=device,
+        )
+
+        return self.joint_tau  # [0:6] = root free-joint = drone wrench
