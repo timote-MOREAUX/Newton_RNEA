@@ -103,51 +103,34 @@ def _build_topology(
     else:
         joint_ids, joint_names = articulation.find_joints(entity_cfg.joint_names)
 
-    # Resolve the articulation USD prim (first env instance).
-    art_prim = None
-    try:
-        path = articulation.root_physx_view.prim_paths[0]
-        art_prim = stage.GetPrimAtPath(path)
-        if not art_prim.IsValid():
-            art_prim = None
-    except (AttributeError, IndexError, TypeError):
-        pass
-
-    if art_prim is None:
-        import re as _re
-        pattern  = articulation.cfg.prim_path
-        concrete = _re.sub(r'\.\*|\{ENV_REGEX_NS\}', 'env_0', pattern)
-        art_prim = stage.GetPrimAtPath(concrete)
-        if not art_prim.IsValid():
-            raise RuntimeError(
-                f"Cannot resolve articulation USD prim from '{pattern}'. "
-                "Ensure env_0 exists or root_physx_view.prim_paths is available."
-            )
+    # Articulation root prim path — used only for error messages.
+    art_path = articulation.root_physx_view.prim_paths[0]
 
     meters_per_unit = float(UsdGeom.GetStageMetersPerUnit(stage))
 
     # ------------------------------------------------------------------ #
-    # Collect all USD joint prims under the articulation.                  #
-    # Isaac Sim articulations are USD instances — PrimRange on an instance #
-    # proxy returns no children.  Traverse the prototype instead so that   #
-    # the full hierarchy is visible.                                        #
+    # Collect all USD joint prims for this articulation.                   #
+    # In Isaac Sim joints can live anywhere in the stage — not necessarily  #
+    # under the articulation root prim.  Search the whole stage and keep   #
+    # prims whose name appears in articulation.joint_names, which IsaacLab #
+    # has already resolved from the PhysX articulation.                    #
     # ------------------------------------------------------------------ #
-    traverse_root = (
-        art_prim.GetPrototype() if art_prim.IsInstance() else art_prim
-    )
+    known_joint_names: set[str] = set(articulation.joint_names)
 
     usd_joints: dict[str, Usd.Prim] = {}
     is_fixed_base = False
-    for prim in Usd.PrimRange(traverse_root):
+    for prim in stage.TraverseAll():
         if prim.IsA(UsdPhysics.RevoluteJoint) or \
                 prim.IsA(UsdPhysics.PrismaticJoint) or \
-                prim.IsA(UsdPhysics.SphericalJoint):
-            usd_joints[prim.GetName()] = prim
-        elif prim.IsA(UsdPhysics.FixedJoint):
-            usd_joints[prim.GetName()] = prim
+                prim.IsA(UsdPhysics.SphericalJoint) or \
+                prim.IsA(UsdPhysics.FixedJoint):
+            name = prim.GetName()
+            if name in known_joint_names:
+                usd_joints[name] = prim
             # A FixedJoint with no body0 relationship is welded to the world.
-            if not prim.GetRelationship("physics:body0").GetTargets():
-                is_fixed_base = True
+            if prim.IsA(UsdPhysics.FixedJoint):
+                if not prim.GetRelationship("physics:body0").GetTargets():
+                    is_fixed_base = True
 
     # ------------------------------------------------------------------ #
     # Parse USD joints → collect raw (full IsaacLab) parent/child indices. #
@@ -210,7 +193,7 @@ def _build_topology(
                 prim = matches[0]
             else:
                 raise RuntimeError(
-                    f"Joint '{jname}' not found under '{art_prim.GetPath()}'. "
+                    f"Joint '{jname}' not found in stage for articulation '{art_path}'. "
                     f"Available USD joints: {list(usd_joints.keys())}"
                 )
 
