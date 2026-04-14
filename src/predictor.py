@@ -127,24 +127,27 @@ def _build_topology(
     meters_per_unit = float(UsdGeom.GetStageMetersPerUnit(stage))
 
     # ------------------------------------------------------------------ #
-    # Collect all USD joint prims under the articulation root prim.        #
+    # Collect all USD joint prims under the articulation.                  #
+    # Isaac Sim articulations are USD instances — PrimRange on an instance #
+    # proxy returns no children.  Traverse the prototype instead so that   #
+    # the full hierarchy is visible.                                        #
     # ------------------------------------------------------------------ #
-    usd_joints: dict[str, Usd.Prim] = {}
-    for prim in Usd.PrimRange(art_prim):
-        if (prim.IsA(UsdPhysics.RevoluteJoint) or
-                prim.IsA(UsdPhysics.PrismaticJoint) or
-                prim.IsA(UsdPhysics.FixedJoint) or
-                prim.IsA(UsdPhysics.SphericalJoint)):
-            usd_joints[prim.GetName()] = prim
-
-    # ------------------------------------------------------------------ #
-    # Fixed-base: a FixedJoint with no body0 is welded to the world.      #
-    # ------------------------------------------------------------------ #
-    is_fixed_base = any(
-        not prim.GetRelationship("physics:body0").GetTargets()
-        for prim in Usd.PrimRange(art_prim)
-        if prim.IsA(UsdPhysics.FixedJoint)
+    traverse_root = (
+        art_prim.GetPrototype() if art_prim.IsInstance() else art_prim
     )
+
+    usd_joints: dict[str, Usd.Prim] = {}
+    is_fixed_base = False
+    for prim in Usd.PrimRange(traverse_root):
+        if prim.IsA(UsdPhysics.RevoluteJoint) or \
+                prim.IsA(UsdPhysics.PrismaticJoint) or \
+                prim.IsA(UsdPhysics.SphericalJoint):
+            usd_joints[prim.GetName()] = prim
+        elif prim.IsA(UsdPhysics.FixedJoint):
+            usd_joints[prim.GetName()] = prim
+            # A FixedJoint with no body0 relationship is welded to the world.
+            if not prim.GetRelationship("physics:body0").GetTargets():
+                is_fixed_base = True
 
     # ------------------------------------------------------------------ #
     # Parse USD joints → collect raw (full IsaacLab) parent/child indices. #
