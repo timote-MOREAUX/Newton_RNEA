@@ -854,6 +854,12 @@ class ArmWrenchPredictor:
 
             qd2d[:, 0:6] = root_vel
             qd2d[:, 6:]  = arm_qd_all
+
+            # DEBUG
+            if torch.isnan(root_pose[0]).any() or torch.isnan(root_vel[0]).any():
+                print(f"[RNEA] NaN in physics INPUT: pose={root_pose[0]}, vel={root_vel[0]}")
+            if torch.isnan(arm_q_all[0]).any() or torch.isnan(arm_qd_all[0]).any():
+                print(f"[RNEA] NaN in arm INPUT: q={arm_q_all[0]}, qd={arm_qd_all[0]}")
         else:
             q2d[:]  = arm_q_all
             qd2d[:] = arm_qd_all
@@ -956,12 +962,27 @@ class ArmWrenchPredictor:
         # memory pool — safe to pass to add_forces_and_torques.
         result = wp.to_torch(self._jtau_b).view(E, topo.total_qd).clone()
 
+        # DEBUG: check raw RNEA output before correction
+        if torch.isnan(result[0, :6]).any():
+            print(f"[RNEA] NaN in raw tau (before shift): {result[0, :6]}")
+            print(f"[RNEA]   root_pose[0] = {self._root_pose_buf[0]}")
+            print(f"[RNEA]   root_vel[0]  = {self._root_vel_buf[0]}")
+            print(f"[RNEA]   arm_qd[0]   = {self._joint_vel_buf[0, self._joint_ids]}")
+
         # Shift wrench from world origin to drone root body position (all envs).
         # Applied to the clone (independent PyTorch memory, not a Warp buffer).
         # No additional sync needed: both ops run on PyTorch's default stream,
         # which IsaacLab already handles correctly (same pattern as 0969809).
         if not topo.is_fixed_base:
             r = self._q_work_b2d[:, 0:3]                    # (E, 3) drone positions
-            result[:, 3:6].sub_(torch.linalg.cross(r, result[:, 0:3]))
+            correction = torch.linalg.cross(r, result[:, 0:3])
+            result[:, 3:6].sub_(correction)
+
+            # DEBUG: check after correction
+            if torch.isnan(result[0, :6]).any():
+                print(f"[RNEA] NaN introduced BY shift correction:")
+                print(f"[RNEA]   r[0]          = {r[0]}")
+                print(f"[RNEA]   force[0]      = {result[0, :3]}")
+                print(f"[RNEA]   correction[0] = {correction[0]}")
 
         return result
