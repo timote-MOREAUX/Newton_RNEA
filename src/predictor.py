@@ -958,10 +958,10 @@ class ArmWrenchPredictor:
 
         # Shift wrench from world origin to drone root body position (all envs).
         # Applied to the clone (independent PyTorch memory, not a Warp buffer).
+        # No additional sync needed: both ops run on PyTorch's default stream,
+        # which IsaacLab already handles correctly (same pattern as 0969809).
         if not topo.is_fixed_base:
             r = self._q_work_b2d[:, 0:3]                    # (E, 3) drone positions
             result[:, 3:6].sub_(torch.linalg.cross(r, result[:, 0:3]))
-            # Ensure the sub_ is visible to PhysX (different CUDA stream).
-            torch.cuda.synchronize()
 
         return result
