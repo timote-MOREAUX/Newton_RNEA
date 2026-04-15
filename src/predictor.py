@@ -330,6 +330,7 @@ class ArmWrenchPredictor:
         entity_cfg: SceneEntityCfg,
         joint_limit_ke: float = 0.0,
         joint_limit_kd: float = 0.0,
+        gravity: tuple[float, float, float] = (0.0, 0.0, -9.81),
     ):
         """
         Args:
@@ -342,6 +343,10 @@ class ArmWrenchPredictor:
             joint_limit_ke:  Spring stiffness for joint-limit enforcement in the RNEA
                              backward pass (default 0 = no limit forces).
             joint_limit_kd:  Damping for joint-limit enforcement (default 0).
+            gravity:         Gravity vector in world frame (m/s²).  Default
+                             ``(0, 0, -9.81)`` matches IsaacLab's standard gravity
+                             and enables full ``g(q) + C(q,q̇)q̇`` compensation.
+                             Pass ``(0, 0, 0)`` for Coriolis-only compensation.
         """
         self._device: str   = env.device
         self._dt:     float = env.physics_dt
@@ -458,9 +463,11 @@ class ArmWrenchPredictor:
         # eval_rigid_tau reads body_f_ext unconditionally — must not be None.
         self.body_f_ext_zero = wp.zeros((num_bodies,),   dtype=wp.spatial_vector, device=device)
 
-        # Single-element zero-gravity array.  Must be wp.vec3 dtype because
-        # the kernel does `gravity[world_idx]` → wp.vec3.
+        # Single-element gravity arrays.  Must be wp.vec3 dtype because the
+        # kernel does `gravity[world_idx]` → wp.vec3.  gravity_zero is kept
+        # for reference; gravity_wp is what the kernels actually use.
         self.gravity_zero      = wp.zeros((1,),             dtype=wp.vec3,    device=device)
+        self.gravity_wp        = wp.array([list(gravity)],  dtype=wp.vec3,    device=device)
         self.joint_f_zero      = wp.zeros((topo.total_qd,), dtype=wp.float32, device=device)
         self.joint_target_zero = wp.zeros((topo.total_qd,), dtype=wp.float32, device=device)
         self.joint_ke_zero     = wp.zeros((topo.total_qd,), dtype=wp.float32, device=device)
@@ -746,7 +753,7 @@ class ArmWrenchPredictor:
                 self.body_q_com,
                 topo.joint_X_p,
                 topo.body_world,
-                self.gravity_zero,
+                self.gravity_wp,
             ],
             outputs=[
                 self.joint_S_s,
@@ -968,3 +975,101 @@ class ArmWrenchPredictor:
             result[bad_rows] = 0.0
 
         return result
+
+    # ---------------------------------------------------------------------- #
+
+    def debug_compensation(
+        self,
+        target: torch.Tensor,
+        mode: InputMode = InputMode.ACCEL,
+        print_interval: int = 10,
+        _s: dict = {},
+    ) -> None:
+        """Apply compensation and log a comparison of gravity vs. Coriolis contributions.
+
+        Runs RNEA twice (with and without gravity) and reads back the forces
+        currently staged in the wrench composer, then stores per-step snapshots.
+        Call this **instead of** ``apply_compensation`` when debugging.
+
+        Args:
+            target:         Same as ``apply_compensation``.
+            mode:           Same as ``apply_compensation``.
+            print_interval: Print a summary every N steps (default 10).
+
+        Stored state (accessible via ``debug_last``):
+            ``comp_gravity``    (E, 6) — with-gravity compensation (negated wrench)
+            ``comp_coriolis``   (E, 6) — Coriolis-only compensation (no gravity)
+            ``gravity_term``    (E, 6) — difference = pure gravity contribution
+            ``applied``         (E, 6) — forces+torques actually in composer buffer
+                                         (written by the *previous* call to this method)
+        """
+        device = self._device
+        E      = self._num_envs
+        total_qd = self._topo.total_qd
+        step = _s.get('step', 0)
+
+        # ---- Read what the composer currently holds (previous step's result) #
+        # shape: (E, num_bodies, 3) → take root body (index 0)
+        prev_force  = self._wrench_composer.composed_force_as_torch[:, 0, :].clone()   # (E, 3)
+        prev_torque = self._wrench_composer.composed_torque_as_torch[:, 0, :].clone()  # (E, 3)
+        applied = torch.cat([prev_force, prev_torque], dim=-1)  # (E, 6)
+
+        # ---- With gravity (current setting) -------------------------------- #
+        self._run_rnea_all(target, mode)
+        wp.synchronize_device(device)
+        tau_g = wp.to_torch(self._jtau_b).view(E, total_qd)[:, :6].clone()
+        comp_gravity = -tau_g   # (E, 6)  compensation = −wrench
+
+        # ---- Coriolis-only (swap to gravity_zero for one pass) ------------- #
+        _orig = self.gravity_wp
+        self.gravity_wp = self.gravity_zero
+        self._run_rnea_all(target, mode)
+        wp.synchronize_device(device)
+        tau_c = wp.to_torch(self._jtau_b).view(E, total_qd)[:, :6].clone()
+        comp_coriolis = -tau_c  # (E, 6)
+        self.gravity_wp = _orig
+
+        gravity_term = comp_gravity - comp_coriolis   # (E, 6)
+
+        # ---- Restore gravity pass and apply compensation ------------------- #
+        self._run_rnea_all(target, mode)
+        wp.launch(
+            extract_root_compensation,
+            dim=E,
+            inputs=[self._jtau_b, total_qd],
+            outputs=[self._comp_force_wp, self._comp_torque_wp],
+            device=device,
+        )
+        self._wrench_composer.add_forces_and_torques(
+            forces=self._comp_force_wp,
+            torques=self._comp_torque_wp,
+            body_ids=self._root_body_id_wp,
+            is_global=True,
+        )
+
+        # ---- Persist for external inspection ------------------------------- #
+        self.debug_last = {
+            'step':          step,
+            'comp_gravity':  comp_gravity,
+            'comp_coriolis': comp_coriolis,
+            'gravity_term':  gravity_term,
+            'applied':       applied,
+        }
+        _s['step'] = step + 1
+
+        # ---- Periodic console summary -------------------------------------- #
+        if step % print_interval == 0:
+            def _stats(t: torch.Tensor) -> str:
+                """mean ± std of per-env L2 norm, env-0 value."""
+                norms = t.norm(dim=-1)          # (E,) or (E,)
+                return (f"norm mean={norms.mean():.4f} max={norms.max():.4f} "
+                        f"| env0={t[0].tolist()}")
+
+            print(f"\n[RNEA debug step={step}]")
+            print(f"  comp_gravity  (F+T): {_stats(comp_gravity)}")
+            print(f"  comp_coriolis (F+T): {_stats(comp_coriolis)}")
+            print(f"  gravity_term  (F+T): {_stats(gravity_term)}")
+            print(f"  applied prev  (F+T): {_stats(applied)}")
+            # Ratio: how much of the compensation is gravitational?
+            g_frac = gravity_term.norm(dim=-1) / (comp_gravity.norm(dim=-1) + 1e-8)
+            print(f"  gravity fraction: mean={g_frac.mean():.2%}  max={g_frac.max():.2%}")
