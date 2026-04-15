@@ -792,6 +792,7 @@ class ArmWrenchPredictor:
         self,
         target: torch.Tensor,
         mode: InputMode = InputMode.ACCEL,
+        _step: list = [0],   # mutable default — call counter
     ) -> torch.Tensor:
         """
         Compute the 6D wrench for **all** environments in a single GPU kernel
@@ -947,4 +948,19 @@ class ArmWrenchPredictor:
 
         # Clone into a contiguous PyTorch tensor fully independent of Warp's
         # memory pool — safe to pass to add_forces_and_torques.
-        return wp.to_torch(self._jtau_b).view(E, topo.total_qd).clone()
+        result = wp.to_torch(self._jtau_b).view(E, topo.total_qd).clone()
+
+        # --- debug ---------------------------------------------------------- #
+        step = _step[0]; _step[0] += 1
+        has_nan = torch.isnan(result).any()
+        has_inf = torch.isinf(result).any()
+        if has_nan or has_inf:
+            print(f"[RNEA step={step}] WARNING: result has {'NaN' if has_nan else ''}"
+                  f"{'Inf' if has_inf else ''}")
+            print(f"[RNEA step={step}]   result[0, :6] = {result[0, :6]}")
+        print(f"[RNEA-DBG step={step}] shape={result.shape} dtype={result.dtype} "
+              f"device={result.device} contiguous={result.is_contiguous()} "
+              f"data_ptr={result.data_ptr():#x}")
+        # -------------------------------------------------------------------- #
+
+        return result
