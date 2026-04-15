@@ -876,7 +876,7 @@ class ArmWrenchPredictor:
                 self._jqds_b, self._jqd_b_wp,
                 self._jaxis_b, self._jdof_b,
                 self._bIm_b, self._bq_b, self._bqcom_b,
-                self._jXp_b, self._bworld_b, self.gravity_zero,
+                self._jXp_b, self._bworld_b, self.gravity_wp,
             ],
             outputs=[self._jS_b, self._bIs_b, self._bv_b, self._bf_b, self._ba_b],
             device=device,
