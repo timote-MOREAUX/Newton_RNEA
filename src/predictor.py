@@ -952,15 +952,28 @@ class ArmWrenchPredictor:
 
         # --- debug ---------------------------------------------------------- #
         step = _step[0]; _step[0] += 1
-        has_nan = torch.isnan(result).any()
-        has_inf = torch.isinf(result).any()
-        if has_nan or has_inf:
-            print(f"[RNEA step={step}] WARNING: result has {'NaN' if has_nan else ''}"
-                  f"{'Inf' if has_inf else ''}")
-            print(f"[RNEA step={step}]   result[0, :6] = {result[0, :6]}")
-        print(f"[RNEA-DBG step={step}] shape={result.shape} dtype={result.dtype} "
-              f"device={result.device} contiguous={result.is_contiguous()} "
-              f"data_ptr={result.data_ptr():#x}")
+        nan_mask = torch.isnan(result)   # (E, total_qd)
+        inf_mask = torch.isinf(result)
+        if nan_mask.any() or inf_mask.any():
+            tag = ("NaN" if nan_mask.any() else "") + ("Inf" if inf_mask.any() else "")
+            # Which columns have bad values (across any env)?
+            bad_cols = (nan_mask | inf_mask).any(dim=0).nonzero(as_tuple=False).squeeze(-1)
+            # Which envs have bad root wrench?
+            bad_root_envs = (nan_mask | inf_mask)[:, :6].any(dim=1).nonzero(as_tuple=False).squeeze(-1)
+            # Which envs have bad arm torques (cols 6+)?
+            bad_arm_envs  = (nan_mask | inf_mask)[:, 6:].any(dim=1).nonzero(as_tuple=False).squeeze(-1)
+            print(f"[RNEA step={step}] {tag} — bad cols={bad_cols.tolist()}")
+            print(f"[RNEA step={step}]   bad root-wrench envs ({len(bad_root_envs)}): {bad_root_envs[:8].tolist()}")
+            print(f"[RNEA step={step}]   bad arm-tau   envs ({len(bad_arm_envs)}): {bad_arm_envs[:8].tolist()}")
+            print(f"[RNEA step={step}]   result[0,  :] = {result[0]}")
+            # Show arm INPUT state for first bad arm env (if any)
+            if len(bad_arm_envs):
+                e = bad_arm_envs[0].item()
+                print(f"[RNEA step={step}]   arm_q [{e}]  = {self._joint_pos_buf[e, self._joint_ids]}")
+                print(f"[RNEA step={step}]   arm_qd[{e}]  = {self._joint_vel_buf[e, self._joint_ids]}")
+                if not topo.is_fixed_base:
+                    print(f"[RNEA step={step}]   root_pose[{e}] = {self._root_pose_buf[e]}")
+                    print(f"[RNEA step={step}]   root_vel [{{e}}] = {self._root_vel_buf[e]}")
         # -------------------------------------------------------------------- #
 
         return result
