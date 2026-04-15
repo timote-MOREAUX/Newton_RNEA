@@ -467,7 +467,10 @@ class ArmWrenchPredictor:
         # kernel does `gravity[world_idx]` → wp.vec3.  gravity_zero is kept
         # for reference; gravity_wp is what the kernels actually use.
         self.gravity_zero      = wp.zeros((1,),             dtype=wp.vec3,    device=device)
-        self.gravity_wp        = wp.array([list(gravity)],  dtype=wp.vec3,    device=device)
+        self.gravity_wp        = wp.array(
+            np.array([[gravity[0], gravity[1], gravity[2]]], dtype=np.float32),
+            dtype=wp.vec3, device=device,
+        )
         self.joint_f_zero      = wp.zeros((topo.total_qd,), dtype=wp.float32, device=device)
         self.joint_target_zero = wp.zeros((topo.total_qd,), dtype=wp.float32, device=device)
         self.joint_ke_zero     = wp.zeros((topo.total_qd,), dtype=wp.float32, device=device)
@@ -1008,11 +1011,11 @@ class ArmWrenchPredictor:
         total_qd = self._topo.total_qd
         step = _s.get('step', 0)
 
-        # ---- Read what the composer currently holds (previous step's result) #
-        # shape: (E, num_bodies, 3) → take root body (index 0)
-        prev_force  = self._wrench_composer.composed_force_as_torch[:, 0, :].clone()   # (E, 3)
-        prev_torque = self._wrench_composer.composed_torque_as_torch[:, 0, :].clone()  # (E, 3)
-        applied = torch.cat([prev_force, prev_torque], dim=-1)  # (E, 6)
+        # ---- Read the compensation we applied last step -------------------- #
+        # The instantaneous_wrench_composer is reset by IsaacLab before
+        # apply_actions, so reading the composer buffer here always gives zeros.
+        # We save our own copy at the end of each call instead.
+        applied = _s.get('prev_applied', torch.zeros(E, 6, device=device))
 
         # ---- With gravity (current setting) -------------------------------- #
         self._run_rnea_all(target, mode)
@@ -1055,6 +1058,8 @@ class ArmWrenchPredictor:
             'gravity_term':  gravity_term,
             'applied':       applied,
         }
+        # Save this step's applied compensation so next call can report it.
+        _s['prev_applied'] = comp_gravity.clone()
         _s['step'] = step + 1
 
         # ---- Periodic console summary -------------------------------------- #
