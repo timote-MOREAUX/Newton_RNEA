@@ -958,6 +958,21 @@ class ArmWrenchPredictor:
         if bad_rows.any():
             result[bad_rows] = 0.0
 
+        # --- debug: watch the region that diverges first -------------------- #
+        watch = slice(4040, 4055)
+        w = result[watch, :6]
+        max_f = w[:, :3].abs().max().item()
+        max_t = w[:, 3:6].abs().max().item()
+        if step % 10 == 0 or max_f > 1.0 or max_t > 1.0:
+            print(f"[RNEA step={step}] envs 4040-4054 wrench: "
+                  f"max_force={max_f:.4f} N  max_torque={max_t:.4f} Nm")
+            if max_f > 1.0 or max_t > 1.0:
+                for e in range(4040, 4055):
+                    print(f"  env {e}: force={result[e, :3].tolist()}  torque={result[e, 3:6].tolist()}")
+                    print(f"         arm_q ={self._joint_pos_buf[e, self._joint_ids].tolist()}")
+                    print(f"         arm_qd={self._joint_vel_buf[e, self._joint_ids].tolist()}")
+        # -------------------------------------------------------------------- #
+
         # --- debug ---------------------------------------------------------- #
         step = _step[0]; _step[0] += 1
         nan_mask = torch.isnan(result)   # (E, total_qd)
