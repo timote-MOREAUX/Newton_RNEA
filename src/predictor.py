@@ -605,7 +605,8 @@ class ArmWrenchPredictor:
         self._bft_b   = wp.zeros((E * NB,),       dtype=wp.spatial_vector, device=device)
         self._bq_b    = wp.empty((E * NB,),       dtype=wp.transform,      device=device)
         self._bqcom_b = wp.empty((E * NB,),       dtype=wp.transform,      device=device)
-        self._jtau_b  = wp.empty((E * total_qd,), dtype=wp.float32,        device=device)
+        self._jtau_b        = wp.empty((E * total_qd,), dtype=wp.float32, device=device)
+        self._jtau_gravity_b = wp.empty((E * total_qd,), dtype=wp.float32, device=device)
 
         self._jf_zero_b      = wp.zeros((E * total_qd,), dtype=wp.float32,        device=device)
         self._jtgt_zero_b    = wp.zeros((E * total_qd,), dtype=wp.float32,        device=device)
@@ -1023,27 +1024,33 @@ class ArmWrenchPredictor:
 
         # ---- With gravity (current setting) -------------------------------- #
         self._run_rnea_all(target, mode)
-        wp.synchronize_device(device)
-        tau_g = wp.to_torch(self._jtau_b).view(E, total_qd)[:, :6].clone()
-        comp_gravity = -tau_g   # (E, 6)  compensation = −wrench
+        # Save result within Warp's stream before overwriting with pass 2.
+        # Using wp.copy avoids a race condition: if we cloned via PyTorch here,
+        # the clone (PyTorch stream) and the next _run_rnea_all (Warp stream)
+        # would race on _jtau_b.  wp.copy stays on Warp's stream — ordered.
+        wp.copy(self._jtau_gravity_b, self._jtau_b)
 
         # ---- Coriolis-only (swap to gravity_zero for one pass) ------------- #
         _orig = self.gravity_wp
         self.gravity_wp = self.gravity_zero
         self._run_rnea_all(target, mode)
-        wp.synchronize_device(device)
-        tau_c = wp.to_torch(self._jtau_b).view(E, total_qd)[:, :6].clone()
-        comp_coriolis = -tau_c  # (E, 6)
         self.gravity_wp = _orig
+
+        # Single sync — both Warp passes are done, safe to read both buffers.
+        wp.synchronize_device(device)
+        tau_g = wp.to_torch(self._jtau_gravity_b).view(E, total_qd)[:, :6].clone()
+        tau_c = wp.to_torch(self._jtau_b).view(E, total_qd)[:, :6].clone()
+        comp_gravity  = -tau_g   # (E, 6)
+        comp_coriolis = -tau_c   # (E, 6)
 
         gravity_term = comp_gravity - comp_coriolis   # (E, 6)
 
-        # ---- Restore gravity pass and apply compensation ------------------- #
-        self._run_rnea_all(target, mode)
+        # ---- Apply compensation using the gravity result already in _jtau_gravity_b #
+        # Re-run extract on the saved gravity buffer (no extra RNEA pass needed).
         wp.launch(
             extract_root_compensation,
             dim=E,
-            inputs=[self._jtau_b, total_qd],
+            inputs=[self._jtau_gravity_b, total_qd],
             outputs=[self._comp_force_wp, self._comp_torque_wp],
             device=device,
         )
