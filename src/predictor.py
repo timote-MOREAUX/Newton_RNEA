@@ -18,6 +18,7 @@ from .kernels import (
     eval_rigid_tau,
     compute_spatial_inertia,
     compute_com_transforms,
+    extract_root_compensation,
 )
 
 
@@ -602,6 +603,15 @@ class ArmWrenchPredictor:
         # eval_rigid_tau reads body_f_ext unconditionally — must not be None.
         self._bfext_zero_b   = wp.zeros((E * NB,),       dtype=wp.spatial_vector, device=device)
 
+        # ---- wrench composer integration ---------------------------------- #
+        # Buffers written by extract_root_compensation and consumed directly by
+        # the wrench composer — no PyTorch intermediate, no extra synchronize.
+        self._wrench_composer  = self.articulation.instantaneous_wrench_composer
+        self._comp_force_wp    = wp.zeros((E, 1), dtype=wp.vec3f, device=device)
+        self._comp_torque_wp   = wp.zeros((E, 1), dtype=wp.vec3f, device=device)
+        # body_ids=[0] — root body is always the first body in the articulation.
+        self._root_body_id_wp  = wp.array([0], dtype=wp.int32, device=device)
+
     # ---------------------------------------------------------------------- #
 
     def compute_root_wrench(
@@ -788,11 +798,142 @@ class ArmWrenchPredictor:
 
     # ---------------------------------------------------------------------- #
 
+    def _run_rnea_all(self, target: torch.Tensor, mode: InputMode) -> None:
+        """Fill ``_jtau_b`` with the RNEA output for all environments.
+
+        Reads joint state from ``Articulation.data``, fills the batched work
+        tensors in-place, and launches FK → ID → tau kernels on Warp's stream.
+        Does **not** synchronize — callers are responsible for synchronization
+        before reading ``_jtau_b`` from a different CUDA stream.
+        """
+        topo   = self._topo
+        device = self._device
+        E      = self._num_envs
+        dt     = self._dt
+
+        arm_q_all  = self._joint_pos_buf[:, self._joint_ids]
+        arm_qd_all = self._joint_vel_buf[:, self._joint_ids]
+
+        if target.dim() == 1:
+            target = target.unsqueeze(0).expand(E, -1)
+
+        if mode is InputMode.ACCEL:
+            pass
+        elif mode is InputMode.VEL:
+            target = (target - arm_qd_all) / dt
+        elif mode is InputMode.POS:
+            target = 2.0 * (target - arm_q_all - arm_qd_all * dt) / (dt * dt)
+        else:
+            raise ValueError(f"Unknown InputMode: {mode}")
+
+        q2d  = self._q_work_b2d
+        qd2d = self._qd_work_b2d
+
+        if not topo.is_fixed_base:
+            root_pose = self._root_pose_buf
+            root_vel  = self._root_vel_buf
+            # Use local origin (0,0,0) — world position causes huge Steiner terms.
+            q2d[:, 0:3] = 0.0
+            q2d[:, 3:6] = root_pose[:, 4:7]   # quat xyz  (IsaacLab w,x,y,z → x,y,z,w)
+            q2d[:, 6]   = root_pose[:, 3]      # quat w
+            q2d[:, 7:]  = arm_q_all
+            qd2d[:, 0:6] = root_vel
+            qd2d[:, 6:]  = arm_qd_all
+        else:
+            q2d[:]  = arm_q_all
+            qd2d[:] = arm_qd_all
+
+        wp.launch(
+            eval_rigid_fk,
+            dim=E,
+            inputs=[
+                self._art_start_b, self._jtype_b, self._jparent_b, self._jchild_b,
+                self._jqs_b, self._jqds_b, self._jq_b_wp,
+                self._jXp_b, self._jXc_b, self._bXcom_b,
+                self._jaxis_b, self._jdof_b,
+            ],
+            outputs=[self._bq_b, self._bqcom_b],
+            device=device,
+        )
+
+        self._bf_b.zero_()
+        wp.launch(
+            eval_rigid_id,
+            dim=E,
+            inputs=[
+                self._art_start_b, self._jtype_b, self._jparent_b, self._jchild_b,
+                self._jqds_b, self._jqd_b_wp,
+                self._jaxis_b, self._jdof_b,
+                self._bIm_b, self._bq_b, self._bqcom_b,
+                self._jXp_b, self._bworld_b, self.gravity_zero,
+            ],
+            outputs=[self._jS_b, self._bIs_b, self._bv_b, self._bf_b, self._ba_b],
+            device=device,
+        )
+
+        self._bft_b.zero_()
+        wp.launch(
+            eval_rigid_tau,
+            dim=E,
+            inputs=[
+                self._art_start_b, self._jtype_b, self._jparent_b, self._jchild_b,
+                self._jqs_b, self._jqds_b, self._jdof_b,
+                self._jtgt_zero_b, self._jtgt_zero_b,
+                self._jq_b_wp, self._jqd_b_wp,
+                self._jf_zero_b, self._jke_zero_b, self._jke_zero_b,
+                self._jlim_lo_b, self._jlim_hi_b, self._jlim_ke_b, self._jlim_kd_b,
+                self._jS_b, self._bf_b, self._bfext_zero_b,
+            ],
+            outputs=[self._bft_b, self._jtau_b],
+            device=device,
+        )
+
+    # ---------------------------------------------------------------------- #
+
+    def apply_compensation(
+        self,
+        target: torch.Tensor,
+        mode: InputMode = InputMode.ACCEL,
+    ) -> None:
+        """Run RNEA and apply feedforward compensation via the wrench composer.
+
+        Equivalent to calling ``compute_all_wrenches``, negating the root
+        wrench, and passing it to ``instantaneous_wrench_composer``, but
+        without any PyTorch intermediate tensor or explicit synchronization —
+        everything stays on Warp's CUDA stream.
+
+        Args:
+            target: Desired arm-joint motion for all environments (same
+                    semantics as ``compute_all_wrenches``).
+            mode:   Interpretation of ``target``.
+        """
+        self._run_rnea_all(target, mode)
+
+        # Negate and NaN-guard the root wrench → (E, 1) vec3f Warp buffers.
+        wp.launch(
+            extract_root_compensation,
+            dim=self._num_envs,
+            inputs=[self._jtau_b, self._topo.total_qd],
+            outputs=[self._comp_force_wp, self._comp_torque_wp],
+            device=self._device,
+        )
+
+        # Pass Warp arrays directly — no clone, no sync needed.
+        # The composer launches its own kernel on the same Warp stream, so
+        # ordering is guaranteed without an explicit wp.synchronize_device.
+        self._wrench_composer.add_forces_and_torques(
+            forces=self._comp_force_wp,
+            torques=self._comp_torque_wp,
+            body_ids=self._root_body_id_wp,
+            is_global=True,
+        )
+
+    # ---------------------------------------------------------------------- #
+
     def compute_all_wrenches(
         self,
         target: torch.Tensor,
         mode: InputMode = InputMode.ACCEL,
-        _step: list = [0],   # mutable default — call counter
     ) -> torch.Tensor:
         """
         Compute the 6D wrench for **all** environments in a single GPU kernel
@@ -811,192 +952,19 @@ class ArmWrenchPredictor:
             each environment.  Negate to obtain the feedforward compensation.
         """
         topo   = self._topo
-        device = self._device
         E      = self._num_envs
-        dt     = self._dt
 
-        arm_q_all  = self._joint_pos_buf[:, self._joint_ids]   # (E, num_arm_joints)
-        arm_qd_all = self._joint_vel_buf[:, self._joint_ids]   # (E, num_arm_joints)
+        self._run_rnea_all(target, mode)
 
-        # ---- Broadcast scalar target if needed ----------------------------- #
-        if target.dim() == 1:
-            target = target.unsqueeze(0).expand(E, -1)          # (E, num_arm_joints)
+        # Sync before handing Warp buffer to PyTorch/PhysX stream.
+        wp.synchronize_device(self._device)
 
-        # ---- Derive qdd from chosen mode ----------------------------------- #
-        if mode is InputMode.ACCEL:
-            pass   # target already holds qdd — not forwarded to kernel yet
-        elif mode is InputMode.VEL:
-            target = (target - arm_qd_all) / dt
-        elif mode is InputMode.POS:
-            target = 2.0 * (target - arm_q_all - arm_qd_all * dt) / (dt * dt)
-        else:
-            raise ValueError(f"Unknown InputMode: {mode}")
-
-        # ---- Fill batched joint-state work tensors in-place (no alloc) ----- #
-        q2d  = self._q_work_b2d   # (E, total_q)  — shares storage with Warp view
-        qd2d = self._qd_work_b2d  # (E, total_qd) — shares storage with Warp view
-
-        if not topo.is_fixed_base:
-            root_pose = self._root_pose_buf   # (E, 7) pos + quat(w,x,y,z)
-            root_vel  = self._root_vel_buf    # (E, 6) lin + ang
-
-            # Use local origin (0,0,0) for root position — see compute_root_wrench.
-            q2d[:, 0:3] = 0.0
-            q2d[:, 3:6] = root_pose[:, 4:7]          # quat xyz  (w,x,y,z → x,y,z,w)
-            q2d[:, 6]   = root_pose[:, 3]             # quat w
-            q2d[:, 7:]  = arm_q_all
-
-            qd2d[:, 0:6] = root_vel
-            qd2d[:, 6:]  = arm_qd_all
-        else:
-            q2d[:]  = arm_q_all
-            qd2d[:] = arm_qd_all
-
-        # ---- 1. Forward kinematics (all envs) ------------------------------ #
-        wp.launch(
-            eval_rigid_fk,
-            dim=E,
-            inputs=[
-                self._art_start_b,
-                self._jtype_b,
-                self._jparent_b,
-                self._jchild_b,
-                self._jqs_b,
-                self._jqds_b,
-                self._jq_b_wp,
-                self._jXp_b,
-                self._jXc_b,
-                self._bXcom_b,
-                self._jaxis_b,
-                self._jdof_b,
-            ],
-            outputs=[self._bq_b, self._bqcom_b],
-            device=device,
-        )
-
-        # ---- 2. RNEA forward pass (Coriolis / centrifugal bias, all envs) -- #
-        self._bf_b.zero_()
-        wp.launch(
-            eval_rigid_id,
-            dim=E,
-            inputs=[
-                self._art_start_b,
-                self._jtype_b,
-                self._jparent_b,
-                self._jchild_b,
-                self._jqds_b,
-                self._jqd_b_wp,
-                self._jaxis_b,
-                self._jdof_b,
-                self._bIm_b,
-                self._bq_b,
-                self._bqcom_b,
-                self._jXp_b,
-                self._bworld_b,
-                self.gravity_zero,
-            ],
-            outputs=[
-                self._jS_b,
-                self._bIs_b,
-                self._bv_b,
-                self._bf_b,
-                self._ba_b,
-            ],
-            device=device,
-        )
-
-        # ---- 3. RNEA backward pass (all envs) ------------------------------ #
-        self._bft_b.zero_()
-        wp.launch(
-            eval_rigid_tau,
-            dim=E,
-            inputs=[
-                self._art_start_b,
-                self._jtype_b,
-                self._jparent_b,
-                self._jchild_b,
-                self._jqs_b,
-                self._jqds_b,
-                self._jdof_b,
-                self._jtgt_zero_b,
-                self._jtgt_zero_b,
-                self._jq_b_wp,
-                self._jqd_b_wp,
-                self._jf_zero_b,
-                self._jke_zero_b,
-                self._jke_zero_b,
-                self._jlim_lo_b,
-                self._jlim_hi_b,
-                self._jlim_ke_b,
-                self._jlim_kd_b,
-                self._jS_b,
-                self._bf_b,
-                self._bfext_zero_b,
-            ],
-            outputs=[
-                self._bft_b,
-                self._jtau_b,
-            ],
-            device=device,
-        )
-
-        # Synchronize the Warp CUDA stream before handing data to PhysX/PyTorch.
-        # Without this, PhysX (which runs on a different CUDA stream) may read
-        # the output buffer before the RNEA kernels have finished writing it,
-        # causing illegal memory access errors.
-        wp.synchronize_device(device)
-
-        # Clone into a contiguous PyTorch tensor fully independent of Warp's
-        # memory pool — safe to pass to add_forces_and_torques.
         result = wp.to_torch(self._jtau_b).view(E, topo.total_qd).clone()
 
-        # Guard: if any env has diverged (NaN/Inf input from physics), its RNEA
-        # output will be NaN. Applying NaN forces to PhysX cascades the failure
-        # to all other envs. Zero out bad rows so only the already-diverged env
-        # is affected, not its neighbours.
+        # Zero out rows where physics has already diverged so NaN forces don't
+        # cascade to neighbouring envs.
         bad_rows = torch.isnan(result).any(dim=1) | torch.isinf(result).any(dim=1)
         if bad_rows.any():
             result[bad_rows] = 0.0
-        step = _step[0]; _step[0] += 1
-
-        # --- debug: watch the region that diverges first -------------------- #
-        watch = slice(4040, 4055)
-        w = result[watch, :6]
-        max_f = w[:, :3].abs().max().item()
-        max_t = w[:, 3:6].abs().max().item()
-        if step % 10 == 0 or max_f > 1.0 or max_t > 1.0:
-            print(f"[RNEA step={step}] envs 4040-4054 wrench: "
-                  f"max_force={max_f:.4f} N  max_torque={max_t:.4f} Nm")
-            if max_f > 1.0 or max_t > 1.0:
-                for e in range(4040, 4055):
-                    print(f"  env {e}: force={result[e, :3].tolist()}  torque={result[e, 3:6].tolist()}")
-                    print(f"         arm_q ={self._joint_pos_buf[e, self._joint_ids].tolist()}")
-                    print(f"         arm_qd={self._joint_vel_buf[e, self._joint_ids].tolist()}")
-        # -------------------------------------------------------------------- #
-
-        # --- debug ---------------------------------------------------------- #
-        nan_mask = torch.isnan(result)   # (E, total_qd)
-        inf_mask = torch.isinf(result)
-        if nan_mask.any() or inf_mask.any():
-            tag = ("NaN" if nan_mask.any() else "") + ("Inf" if inf_mask.any() else "")
-            # Which columns have bad values (across any env)?
-            bad_cols = (nan_mask | inf_mask).any(dim=0).nonzero(as_tuple=False).squeeze(-1)
-            # Which envs have bad root wrench?
-            bad_root_envs = (nan_mask | inf_mask)[:, :6].any(dim=1).nonzero(as_tuple=False).squeeze(-1)
-            # Which envs have bad arm torques (cols 6+)?
-            bad_arm_envs  = (nan_mask | inf_mask)[:, 6:].any(dim=1).nonzero(as_tuple=False).squeeze(-1)
-            print(f"[RNEA step={step}] {tag} — bad cols={bad_cols.tolist()}")
-            print(f"[RNEA step={step}]   bad root-wrench envs ({len(bad_root_envs)}): {bad_root_envs[:8].tolist()}")
-            print(f"[RNEA step={step}]   bad arm-tau   envs ({len(bad_arm_envs)}): {bad_arm_envs[:8].tolist()}")
-            print(f"[RNEA step={step}]   result[0,  :] = {result[0]}")
-            # Show arm INPUT state for first bad arm env (if any)
-            if len(bad_arm_envs):
-                e = bad_arm_envs[0].item()
-                print(f"[RNEA step={step}]   arm_q [{e}]  = {self._joint_pos_buf[e, self._joint_ids]}")
-                print(f"[RNEA step={step}]   arm_qd[{e}]  = {self._joint_vel_buf[e, self._joint_ids]}")
-                if not topo.is_fixed_base:
-                    print(f"[RNEA step={step}]   root_pose[{e}] = {self._root_pose_buf[e]}")
-                    print(f"[RNEA step={step}]   root_vel [{{e}}] = {self._root_vel_buf[e]}")
-        # -------------------------------------------------------------------- #
 
         return result

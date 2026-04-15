@@ -864,6 +864,31 @@ def compute_com_transforms(
 
 
 @wp.kernel
+def extract_root_compensation(
+    jtau_b:     wp.array(dtype=wp.float32),   # flat (E * total_qd,)
+    total_qd:   int,
+    force_out:  wp.array2d(dtype=wp.vec3f),   # (E, 1) — root body per env
+    torque_out: wp.array2d(dtype=wp.vec3f),   # (E, 1)
+):
+    """Negate and NaN-guard the root 6D wrench, writing into (E, 1) vec3f buffers.
+
+    Compensation = −RNEA wrench.  Envs with NaN velocities (diverged physics)
+    produce zero forces so they cannot corrupt their neighbours in PhysX.
+    """
+    e   = wp.tid()
+    off = e * total_qd
+    fx = jtau_b[off + 0];  fy = jtau_b[off + 1];  fz = jtau_b[off + 2]
+    tx = jtau_b[off + 3];  ty = jtau_b[off + 4];  tz = jtau_b[off + 5]
+    # NaN check: NaN is the only value where x != x
+    if fx != fx or fy != fy or fz != fz or tx != tx or ty != ty or tz != tz:
+        force_out[e, 0]  = wp.vec3f(0.0, 0.0, 0.0)
+        torque_out[e, 0] = wp.vec3f(0.0, 0.0, 0.0)
+    else:
+        force_out[e, 0]  = wp.vec3f(-fx, -fy, -fz)
+        torque_out[e, 0] = wp.vec3f(-tx, -ty, -tz)
+
+
+@wp.kernel
 def shift_root_wrench_to_body(
     joint_q:   wp.array(dtype=wp.float32),   # full q array; [0:3] = drone position (x,y,z)
     joint_tau: wp.array(dtype=wp.float32),   # full tau array; [3:6] corrected in-place
