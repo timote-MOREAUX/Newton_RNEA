@@ -957,6 +957,7 @@ class ArmWrenchPredictor:
         bad_rows = torch.isnan(result).any(dim=1) | torch.isinf(result).any(dim=1)
         if bad_rows.any():
             result[bad_rows] = 0.0
+        step = _step[0]; _step[0] += 1
 
         # --- debug: watch the region that diverges first -------------------- #
         watch = slice(4040, 4055)
@@ -974,7 +975,6 @@ class ArmWrenchPredictor:
         # -------------------------------------------------------------------- #
 
         # --- debug ---------------------------------------------------------- #
-        step = _step[0]; _step[0] += 1
         nan_mask = torch.isnan(result)   # (E, total_qd)
         inf_mask = torch.isinf(result)
         if nan_mask.any() or inf_mask.any():
