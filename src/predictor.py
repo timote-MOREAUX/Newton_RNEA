@@ -468,7 +468,7 @@ class ArmWrenchPredictor:
         # for reference; gravity_wp is what the kernels actually use.
         self.gravity_zero      = wp.zeros((1,),             dtype=wp.vec3,    device=device)
         self.gravity_wp        = wp.array(
-            np.array([[gravity[0], gravity[1], gravity[2]]], dtype=np.float32),
+            [wp.vec3(gravity[0], gravity[1], gravity[2])],
             dtype=wp.vec3, device=device,
         )
         self.joint_f_zero      = wp.zeros((topo.total_qd,), dtype=wp.float32, device=device)
@@ -1010,6 +1010,10 @@ class ArmWrenchPredictor:
         E      = self._num_envs
         total_qd = self._topo.total_qd
         step = _s.get('step', 0)
+
+        # One-time sanity check on the gravity vector.
+        if step == 0:
+            print(f"[RNEA debug] gravity_wp = {self.gravity_wp.numpy()}")
 
         # ---- Read the compensation we applied last step -------------------- #
         # The instantaneous_wrench_composer is reset by IsaacLab before
