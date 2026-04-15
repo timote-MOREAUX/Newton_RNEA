@@ -950,6 +950,14 @@ class ArmWrenchPredictor:
         # memory pool — safe to pass to add_forces_and_torques.
         result = wp.to_torch(self._jtau_b).view(E, topo.total_qd).clone()
 
+        # Guard: if any env has diverged (NaN/Inf input from physics), its RNEA
+        # output will be NaN. Applying NaN forces to PhysX cascades the failure
+        # to all other envs. Zero out bad rows so only the already-diverged env
+        # is affected, not its neighbours.
+        bad_rows = torch.isnan(result).any(dim=1) | torch.isinf(result).any(dim=1)
+        if bad_rows.any():
+            result[bad_rows] = 0.0
+
         # --- debug ---------------------------------------------------------- #
         step = _step[0]; _step[0] += 1
         nan_mask = torch.isnan(result)   # (E, total_qd)
