@@ -1024,10 +1024,6 @@ class ArmWrenchPredictor:
 
         # ---- With gravity (current setting) -------------------------------- #
         self._run_rnea_all(target, mode)
-        # Save result within Warp's stream before overwriting with pass 2.
-        # Using wp.copy avoids a race condition: if we cloned via PyTorch here,
-        # the clone (PyTorch stream) and the next _run_rnea_all (Warp stream)
-        # would race on _jtau_b.  wp.copy stays on Warp's stream — ordered.
         wp.copy(self._jtau_gravity_b, self._jtau_b)
 
         # ---- Coriolis-only (swap to gravity_zero for one pass) ------------- #
@@ -1036,12 +1032,27 @@ class ArmWrenchPredictor:
         self._run_rnea_all(target, mode)
         self.gravity_wp = _orig
 
-        # Single sync — both Warp passes are done, safe to read both buffers.
+        # Single sync.
         wp.synchronize_device(device)
         tau_g = wp.to_torch(self._jtau_gravity_b).view(E, total_qd)[:, :6].clone()
         tau_c = wp.to_torch(self._jtau_b).view(E, total_qd)[:, :6].clone()
         comp_gravity  = -tau_g   # (E, 6)
         comp_coriolis = -tau_c   # (E, 6)
+
+        # ---- Raw diagnostic (step 0 only) ---------------------------------- #
+        if step == 0:
+            print(f"[RNEA grav-diag] gravity_wp  = {self.gravity_wp.numpy()}")
+            print(f"[RNEA grav-diag] gravity_zero= {self.gravity_zero.numpy()}")
+            # Raw tau for env 0 from both passes — should differ if gravity works
+            print(f"[RNEA grav-diag] tau_g[0,:6] = {tau_g[0].tolist()}")
+            print(f"[RNEA grav-diag] tau_c[0,:6] = {tau_c[0].tolist()}")
+            # Verify _jtau_gravity_b vs _jtau_b are different objects
+            print(f"[RNEA grav-diag] _jtau_gravity_b ptr={self._jtau_gravity_b.ptr:#x}")
+            print(f"[RNEA grav-diag] _jtau_b        ptr={self._jtau_b.ptr:#x}")
+            # Check body_f_s (forward pass output) for env 0 body 0 — carries gravity
+            bf0 = wp.to_torch(self._bf_b)[:6].clone()
+            print(f"[RNEA grav-diag] body_f_s[0]  = {bf0.tolist()}  (should differ with gravity)")
+        # -------------------------------------------------------------------- #
 
         gravity_term = comp_gravity - comp_coriolis   # (E, 6)
 
