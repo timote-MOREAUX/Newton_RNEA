@@ -19,7 +19,6 @@ from .kernels import (
     compute_spatial_inertia,
     compute_com_transforms,
     shift_root_wrench_to_body,
-    shift_root_wrenches_to_body,
 )
 
 
@@ -947,23 +946,22 @@ class ArmWrenchPredictor:
             device=device,
         )
 
-        # Shift wrench from world origin to drone root body position (all envs).
-        # Must run before wp.synchronize_device so the single sync covers all
-        # kernel work — same invariant as compute_root_wrench.
-        if not topo.is_fixed_base:
-            wp.launch(
-                shift_root_wrenches_to_body,
-                dim=E,
-                inputs=[self._jq_b_wp, self._jtau_b, topo.total_q, topo.total_qd],
-                device=device,
-            )
-
         # Synchronize the Warp CUDA stream before handing data to PhysX/PyTorch.
         # Without this, PhysX (which runs on a different CUDA stream) may read
         # the output buffer before the RNEA kernels have finished writing it,
         # causing illegal memory access errors.
         wp.synchronize_device(device)
 
-        # Clone into a contiguous PyTorch tensor that is fully independent of
-        # Warp's memory pool — safe to pass directly to add_forces_and_torques.
-        return wp.to_torch(self._jtau_b).view(E, topo.total_qd).clone()
+        # Clone into a contiguous PyTorch tensor fully independent of Warp's
+        # memory pool — safe to pass to add_forces_and_torques.
+        result = wp.to_torch(self._jtau_b).view(E, topo.total_qd).clone()
+
+        # Shift wrench from world origin to drone root body position (all envs).
+        # Applied to the clone (independent PyTorch memory, not a Warp buffer).
+        if not topo.is_fixed_base:
+            r = self._q_work_b2d[:, 0:3]                    # (E, 3) drone positions
+            result[:, 3:6].sub_(torch.linalg.cross(r, result[:, 0:3]))
+            # Ensure the sub_ is visible to PhysX (different CUDA stream).
+            torch.cuda.synchronize()
+
+        return result
