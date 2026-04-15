@@ -947,14 +947,9 @@ class ArmWrenchPredictor:
             device=device,
         )
 
-        # Synchronize the Warp CUDA stream before handing data to PhysX/PyTorch.
-        # Without this, PhysX (which runs on a different CUDA stream) may read
-        # the output buffer before the RNEA kernels have finished writing it,
-        # causing illegal memory access errors.
-        wp.synchronize_device(device)
-
         # Shift wrench from world origin to drone root body position (all envs).
-        # Runs in Warp's stream before synchronize — no cross-stream hazard.
+        # Must run before wp.synchronize_device so the single sync covers all
+        # kernel work — same invariant as compute_root_wrench.
         if not topo.is_fixed_base:
             wp.launch(
                 shift_root_wrenches_to_body,
@@ -963,6 +958,10 @@ class ArmWrenchPredictor:
                 device=device,
             )
 
+        # Synchronize the Warp CUDA stream before handing data to PhysX/PyTorch.
+        # Without this, PhysX (which runs on a different CUDA stream) may read
+        # the output buffer before the RNEA kernels have finished writing it,
+        # causing illegal memory access errors.
         wp.synchronize_device(device)
 
         # Clone into a contiguous PyTorch tensor that is fully independent of
